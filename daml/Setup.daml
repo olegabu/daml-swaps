@@ -1,0 +1,90 @@
+module Setup where
+
+import DA.Date (Month(Jul), date)
+import Daml.Script
+import Cash
+import IRS
+import Types
+
+-- Runs automatically on every `daml start` (wired via daml.yaml's
+-- `init-script`), before Navigator/JSON API come up, so Alice, Bob,
+-- Charlie and the Bank always exist on a fresh sandbox instead of
+-- requiring manual allocation.
+setup : Script ()
+setup = do
+  alice <- allocatePartyWithHint "Alice" (PartyIdHint "Alice")
+  bob <- allocatePartyWithHint "Bob" (PartyIdHint "Bob")
+  charlie <- allocatePartyWithHint "Charlie" (PartyIdHint "Charlie")
+  bank <- allocatePartyWithHint "Bank" (PartyIdHint "Bank")
+  oracle <- allocatePartyWithHint "Oracle" (PartyIdHint "Oracle")
+
+  aliceId <- validateUserId "alice"
+  bobId <- validateUserId "bob"
+  charlieId <- validateUserId "charlie"
+  bankId <- validateUserId "bank"
+  oracleId <- validateUserId "oracle"
+
+  createUser (User aliceId (Some alice)) [CanActAs alice]
+  createUser (User bobId (Some bob)) [CanActAs bob]
+  createUser (User charlieId (Some charlie)) [CanActAs charlie]
+  createUser (User bankId (Some bank)) [CanActAs bank]
+  createUser (User oracleId (Some oracle)) [CanActAs oracle]
+
+  -- Bank funds both counterparties first, so each has a settlement account
+  -- to name when the trade is struck (and something for the DvP to move).
+  aliceCash <- submit bank do
+    createCmd CashHolding with
+      issuer = bank
+      owner = alice
+      label = "Alice-USD"
+      currency = USD
+      amount = 1000000.0
+      observers = [oracle]
+
+  bobCash <- submit bank do
+    createCmd CashHolding with
+      issuer = bank
+      owner = bob
+      label = "Bob-USD"
+      currency = USD
+      amount = 1000000.0
+      observers = [oracle]
+
+  -- Charlie isn't a party to the seeded trade, but gets an account up front
+  -- so he can accept a novation (ProposeNovation / AcceptNovation).
+  _ <- submit bank do
+    createCmd CashHolding with
+      issuer = bank
+      owner = charlie
+      label = "Charlie-USD"
+      currency = USD
+      amount = 1000000.0
+      observers = [oracle]
+
+  -- Seed a live IRSTrade via the real propose-accept flow (not a
+  -- multi-party submit) so the demo exercises the same authorization
+  -- path a real counterparty negotiation would use. Each party names its
+  -- own settlement account.
+  proposalCid <- submit alice do
+    createCmd IRSProposal with
+      proposer = alice
+      counterparty = bob
+      oracle
+      proposerCashCid = aliceCash
+      notional = 10000000.0
+      fixedLeg = FixedLeg with
+        fixedRate = 0.04
+        dayCount = Thirty360
+        frequency = Quarterly
+      floatingLeg = FloatingLeg with
+        floatingIndex = SOFR
+        spread = 0.0
+        dayCount = Act360
+        frequency = Quarterly
+      effectiveDate = date 2026 Jul 20
+      maturityDate = date 2027 Jul 20
+
+  _ <- submit bob do
+    exerciseCmd proposalCid AcceptIRS with counterpartyCashCid = bobCash
+
+  pure ()

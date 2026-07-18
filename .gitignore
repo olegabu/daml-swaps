@@ -1,0 +1,13 @@
+# Daml build artifacts
+.daml/
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
+# Logs
+log/
+*.log

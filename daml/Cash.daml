@@ -1,0 +1,66 @@
+module Cash where
+
+import Types (Currency)
+
+-- Minimal tokenized cash "holding" used to demonstrate the DvP pattern
+-- discussed for margin/settlement: transferring a cash-token holding in the
+-- SAME atomic transaction as the derivative's state update, rather than
+-- treating settlement as a separate off-ledger wire.
+--
+-- In a production system this would more likely be an external, standards-
+-- based token (e.g. a Canton Token Standard / CIP-56 asset representing a
+-- tokenized deposit or USDCx holding) rather than a bespoke template --
+-- this local version exists purely so the IRS contract's margin/settlement
+-- choices have something concrete to exercise against during dev.
+
+template CashHolding
+  with
+    issuer    : Party      -- e.g. the bank issuing the tokenized deposit
+    owner     : Party
+    label     : Text       -- human-readable alias, e.g. "Alice-USD", so the
+                           -- account is identifiable at a glance in Navigator
+    currency  : Currency
+    amount    : Decimal
+    observers : [Party]    -- the trade's oracle/settlement agent: it can see
+                           -- this account AND must co-authorize any balance
+                           -- change (see AdjustBalance) -- so cash only ever
+                           -- moves inside a settlement, never by the owner alone
+  where
+    signatory issuer
+    observer owner, observers
+
+    ensure amount >= 0.0
+
+    -- Debits or credits the balance in place (archive-and-recreate, since
+    -- DAML has no true mutation). This is the primitive the IRS trade's
+    -- atomic DvP is built on: one account per party, adjusted directly,
+    -- rather than splitting a holding into pieces per payment.
+    --
+    -- Controlled by owner + observers (the settlement agent / oracle), NOT
+    -- the owner alone. So a counterparty CANNOT move -- or mint into -- its
+    -- own account unilaterally: a direct submit as just the owner (e.g. from
+    -- Navigator) fails authorization because the oracle's authority is
+    -- missing. The balance only ever changes inside an IRSTrade settlement,
+    -- where the trade already carries the owner's signatory authority AND the
+    -- oracle is the controller of SettlePeriod/SettleMargin -- so both
+    -- required authorities are present together, and nowhere else. Keeping
+    -- the owner from adjusting on its own also stops the account being
+    -- archived out-of-band, which would strand the contract id the trade
+    -- holds and break the next settle with CONTRACT_NOT_FOUND.
+    --
+    -- (`observers` is [oracle] on every account created here; requiring the
+    -- whole observer set to co-authorize keeps this one-controller-line fix
+    -- self-contained. If a non-settlement observer is ever added, give the
+    -- account a dedicated settlement-agent field instead.)
+    --
+    -- `delta` positive = credit (receiver), negative = debit (payer). The
+    -- `ensure amount >= 0.0` above (re-checked here) is what makes an
+    -- overdrawn debit fail -- the IRS choice checks the balance first and
+    -- routes to default instead of letting this abort the transaction.
+    choice AdjustBalance : ContractId CashHolding
+      with
+        delta : Decimal
+      controller owner :: observers
+      do
+        assertMsg "Insufficient balance" (amount + delta >= 0.0)
+        create this with amount = amount + delta

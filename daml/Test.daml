@@ -1,0 +1,366 @@
+module Test where
+
+import DA.Date (Month(Jan, Feb, Mar, Apr, Jul, Oct), date)
+import Daml.Script
+import Cash
+import IRS
+import Types
+
+-- Shared fixture: allocate parties, fund both accounts with `aliceAmt` /
+-- `bobAmt`, strike the trade, return everything the tests need.
+data Fixture = Fixture with
+  alice : Party
+  bob : Party
+  oracle : Party
+  tradeCid : ContractId IRSTrade
+
+setupTrade : Decimal -> Decimal -> Script Fixture
+setupTrade aliceAmt bobAmt = do
+  bank   <- allocateParty "Bank"
+  alice  <- allocateParty "Alice"
+  bob    <- allocateParty "Bob"
+  oracle <- allocateParty "Oracle"
+
+  aliceCash <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = alice; label = "Alice-USD"; currency = USD; amount = aliceAmt; observers = [oracle]
+  bobCash <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = bob; label = "Bob-USD"; currency = USD; amount = bobAmt; observers = [oracle]
+
+  proposalCid <- submit alice do
+    createCmd IRSProposal with
+      proposer = alice
+      counterparty = bob
+      oracle
+      proposerCashCid = aliceCash
+      notional = 10000000.0
+      fixedLeg = FixedLeg with
+        fixedRate = 0.04; dayCount = Thirty360; frequency = Quarterly
+      floatingLeg = FloatingLeg with
+        floatingIndex = SOFR; spread = 0.0; dayCount = Act360; frequency = Quarterly
+      effectiveDate = date 2026 Jul 20
+      maturityDate = date 2027 Jul 20
+
+  tradeCid <- submit bob do exerciseCmd proposalCid AcceptIRS with counterpartyCashCid = bobCash
+  pure Fixture with alice; bob; oracle; tradeCid
+
+-- Helper: total balance a party can see across their CashHoldings.
+balanceOf : Party -> Script Decimal
+balanceOf p = do
+  holdings <- query @CashHolding p
+  pure $ sum [c.amount | (_, c) <- holdings, c.owner == p]
+
+-- Direct, ledger-free checks of Types.daml's dayCountFraction. The
+-- SettlePeriod tests below only ever hit a round 90/360 = 0.25 span, which
+-- wouldn't catch a scaling bug that happens to still land on 0.25. These
+-- pin down Act360/Act365 (never otherwise exercised -- SettlePeriod only
+-- ever reads fixedLeg.dayCount, and the fixture's fixedLeg is Thirty360)
+-- and Thirty360's day-31 capping logic specifically.
+
+testAct360Fraction : Script ()
+testAct360Fraction =
+  -- Jan 1 -> Feb 15 is 45 actual days: 45/360 = 0.125.
+  assertMsg "Act360: 45/360 = 0.125"
+    (dayCountFraction Act360 (date 2026 Jan 1) (date 2026 Feb 15) == 0.125)
+
+testAct365Fraction : Script ()
+testAct365Fraction =
+  -- Jan 1 -> Mar 15 is 73 actual days: 73/365 = 0.2 exactly.
+  assertMsg "Act365: 73/365 = 0.2"
+    (dayCountFraction Act365 (date 2026 Jan 1) (date 2026 Mar 15) == 0.2)
+
+-- Thirty360 treats a day-31 PERIOD START as day 30 (d1' = min d1 30).
+-- Jan 31 -> Apr 30 is 90 days under the capped rule (30*3 + (30-30));
+-- without the cap it would be 89 days (30*3 + (30-31)) -- pinning that the
+-- cap actually fires, not just an arbitrary number.
+testThirty360CapsStartDay31 : Script ()
+testThirty360CapsStartDay31 =
+  assertMsg "Thirty360: Jan31 start capped to 30 -> 90/360 = 0.25"
+    (dayCountFraction Thirty360 (date 2026 Jan 31) (date 2026 Apr 30) == 0.25)
+
+-- Thirty360 ALSO caps a day-31 PERIOD END to 30, but only when the
+-- (already-capped) start day is exactly 30 (d2' = 30 if d2 == 31 && d1' ==
+-- 30). Apr 30 -> Jul 31 is 90 days under that rule (30*3 + (30-30));
+-- without it, 91 days (30*3 + (31-30)).
+testThirty360CapsEndDay31 : Script ()
+testThirty360CapsEndDay31 =
+  assertMsg "Thirty360: Jul31 end capped to 30 -> 90/360 = 0.25"
+    (dayCountFraction Thirty360 (date 2026 Apr 30) (date 2026 Jul 31) == 0.25)
+
+-- Happy path: oracle settles a period below the fixed rate, so Alice (fixed
+-- payer) owes Bob. 0.04 - 0.035 = 0.005 * 10M * 0.25 = 12,500.
+testSettlePeriodMovesCash : Script ()
+testSettlePeriodMovesCash = do
+  f <- setupTrade 1000000.0 1000000.0
+  res <- submit f.oracle do
+    exerciseCmd f.tradeCid SettlePeriod with periodEnd = date 2026 Oct 20; observedRate = 0.035
+  case res of
+    Left _ -> abort "expected trade to continue, got default"
+    Right _ -> pure ()
+  aliceBal <- balanceOf f.alice
+  bobBal <- balanceOf f.bob
+  assertMsg "Alice debited 12500" (aliceBal == 987500.0)
+  assertMsg "Bob credited 12500" (bobBal == 1012500.0)
+
+-- Margin: positive MTM favors Alice, so Bob posts to Alice. Also checks the
+-- margin call lands on `history` as a MarginEvent -- same list SettlePeriod
+-- appends PeriodEvents to (see Types.daml's LifecycleEvent).
+testSettleMarginMovesCash : Script ()
+testSettleMarginMovesCash = do
+  f <- setupTrade 1000000.0 1000000.0
+  res <- submit f.oracle do
+    exerciseCmd f.tradeCid SettleMargin with asOf = date 2026 Jul 20; markToMarket = 50000.0
+  tradeCid <- case res of
+    Left _ -> abort "expected trade to continue, got default"
+    Right cid -> pure cid
+  aliceBal <- balanceOf f.alice
+  bobBal <- balanceOf f.bob
+  assertMsg "Alice credited 50000" (aliceBal == 1050000.0)
+  assertMsg "Bob debited 50000" (bobBal == 950000.0)
+
+  Some trade <- queryContractId f.alice tradeCid
+  case trade.history of
+    [MarginEvent m] -> do
+      assertMsg "recorded markToMarket" (m.markToMarket == 50000.0)
+      assertMsg "recorded netPayment" (m.netPayment == 50000.0)
+      assertMsg "Bob paid" (m.paidBy == f.bob)
+      assertMsg "Alice received" (m.paidTo == f.alice)
+    _ -> abort "expected exactly one MarginEvent in history"
+
+-- History is one ordered trail across both event kinds: a period settle
+-- followed by a margin call appends a PeriodEvent then a MarginEvent, in
+-- that order, on the same `history` list.
+testHistoryOrdersMixedEvents : Script ()
+testHistoryOrdersMixedEvents = do
+  f <- setupTrade 1000000.0 1000000.0
+  Right afterPeriod <- submit f.oracle do
+    exerciseCmd f.tradeCid SettlePeriod with periodEnd = date 2026 Oct 20; observedRate = 0.035
+  Right afterMargin <- submit f.oracle do
+    exerciseCmd afterPeriod SettleMargin with asOf = date 2026 Jul 21; markToMarket = 50000.0
+
+  Some trade <- queryContractId f.alice afterMargin
+  case trade.history of
+    [PeriodEvent _, MarginEvent _] -> pure ()
+    _ -> abort "expected [PeriodEvent, MarginEvent] in that order"
+
+-- Default: Bob owes a margin he can't cover -> SettlementFailed, no live trade.
+testInsufficientDefaults : Script ()
+testInsufficientDefaults = do
+  f <- setupTrade 1000000.0 10000.0   -- Bob only has 10k
+  res <- submit f.oracle do
+    exerciseCmd f.tradeCid SettleMargin with asOf = date 2026 Jul 20; markToMarket = 50000.0  -- Bob owes 50k
+  case res of
+    Right _ -> abort "expected default, got a live trade"
+    Left defCid -> do
+      Some d <- queryContractId f.alice defCid
+      assertMsg "defaulting party is Bob" (d.defaultingParty == f.bob)
+      assertMsg "amount owed 50000" (d.amountOwed == 50000.0)
+      assertMsg "amount available 10000" (d.amountAvailable == 10000.0)
+      assertMsg "context is SettleMargin" (d.context == "SettleMargin")
+  -- No live IRSTrade should remain.
+  trades <- query @IRSTrade f.alice
+  assertMsg "no live trade after default" (null trades)
+
+-- Authorization guard: a counterparty cannot self-submit a settlement.
+testPartyCannotSettle : Script ()
+testPartyCannotSettle = do
+  f <- setupTrade 1000000.0 1000000.0
+  submitMustFail f.alice do
+    exerciseCmd f.tradeCid SettlePeriod with periodEnd = date 2026 Oct 20; observedRate = 0.035
+
+-- Authorization guard: a counterparty cannot adjust its own cash account
+-- directly (would let it mint into / drain its own balance out-of-band, and
+-- strand the contract id the trade holds). AdjustBalance needs owner + oracle
+-- together, which only ever co-occur inside an IRSTrade settlement.
+testPartyCannotAdjustOwnCash : Script ()
+testPartyCannotAdjustOwnCash = do
+  bank   <- allocateParty "Bank"
+  alice  <- allocateParty "Alice"
+  oracle <- allocateParty "Oracle"
+  aliceCash <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = alice; label = "Alice-USD"; currency = USD; amount = 1000000.0; observers = [oracle]
+  -- Alice, submitting as only herself, can neither mint (credit) ...
+  submitMustFail alice do
+    exerciseCmd aliceCash AdjustBalance with delta = 500000.0
+  -- ... nor move her own funds without the oracle co-authorizing.
+  submitMustFail alice do
+    exerciseCmd aliceCash AdjustBalance with delta = -1.0
+
+-- Sanity guard: an out-of-band rate (fat-fingered 3 = 300%) fails loudly
+-- rather than silently defaulting the trade.
+testRateOutOfBandRejected : Script ()
+testRateOutOfBandRejected = do
+  f <- setupTrade 1000000.0 1000000.0
+  submitMustFail f.oracle do
+    exerciseCmd f.tradeCid SettlePeriod with periodEnd = date 2026 Oct 20; observedRate = 3.0
+
+-- Sanity guard: a mark-to-market above notional is rejected.
+testMtmAboveNotionalRejected : Script ()
+testMtmAboveNotionalRejected = do
+  f <- setupTrade 1000000.0 1000000.0
+  submitMustFail f.oracle do
+    exerciseCmd f.tradeCid SettleMargin with asOf = date 2026 Jul 20; markToMarket = 20000000.0
+
+-- Guard: a periodEnd that isn't after lastSettledDate (here, exactly
+-- effectiveDate on a fresh trade) would feed dayCountFraction zero or
+-- negative elapsed days -- reject it before it can corrupt the payment.
+testPeriodEndMustBeAfterLastSettled : Script ()
+testPeriodEndMustBeAfterLastSettled = do
+  f <- setupTrade 1000000.0 1000000.0
+  submitMustFail f.oracle do
+    exerciseCmd f.tradeCid SettlePeriod with periodEnd = date 2026 Jul 20; observedRate = 0.035
+
+-- The trade tracks its own schedule position (lastSettledDate), not the
+-- oracle's word for it: settling Q1 (Jul 20 -> Oct 20) advances it to
+-- Oct 20, so re-submitting periodEnd = Oct 20 a second time is rejected
+-- (not after the new lastSettledDate), while a genuine Q2 (Oct 20 ->
+-- Jan 20) succeeds and, under Thirty360, nets the same 12,500 as Q1 --
+-- confirming the fraction is computed from the ADVANCED date, not the
+-- original effectiveDate.
+testSecondPeriodUsesLastSettledDate : Script ()
+testSecondPeriodUsesLastSettledDate = do
+  f <- setupTrade 1000000.0 1000000.0
+  Right afterQ1 <- submit f.oracle do
+    exerciseCmd f.tradeCid SettlePeriod with periodEnd = date 2026 Oct 20; observedRate = 0.035
+
+  submitMustFail f.oracle do
+    exerciseCmd afterQ1 SettlePeriod with periodEnd = date 2026 Oct 20; observedRate = 0.035
+
+  res <- submit f.oracle do
+    exerciseCmd afterQ1 SettlePeriod with periodEnd = date 2027 Jan 20; observedRate = 0.035
+  case res of
+    Left _ -> abort "expected Q2 to settle, got default"
+    Right _ -> pure ()
+  aliceBal <- balanceOf f.alice
+  assertMsg "Alice debited 12500 twice (Q1 + Q2)" (aliceBal == 975000.0)
+
+-- Novation happy path: Bob proposes to step out for Charlie; Charlie
+-- accepts, bringing his own account. New trade has Charlie in Bob's slot,
+-- and the old trade no longer exists.
+testNovationAcceptReplacesParty : Script ()
+testNovationAcceptReplacesParty = do
+  f <- setupTrade 1000000.0 1000000.0
+  bank <- allocateParty "Bank"
+  charlie <- allocateParty "Charlie"
+  charlieCash <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = charlie; label = "Charlie-USD"; currency = USD; amount = 1000000.0; observers = [f.oracle]
+
+  proposalCid <- submit f.bob do
+    exerciseCmd f.tradeCid ProposeNovation with transferor = f.bob; transferee = charlie
+
+  newTradeCid <- submit charlie do
+    exerciseCmd proposalCid AcceptNovation with transfereeCashCid = charlieCash
+
+  Some trade <- queryContractId f.alice newTradeCid
+  assertMsg "fixedRatePayer unchanged" (trade.fixedRatePayer == f.alice)
+  assertMsg "floatingRatePayer is now Charlie" (trade.floatingRatePayer == charlie)
+  assertMsg "floatingRatePayerCashCid is Charlie's account" (trade.floatingRatePayerCashCid == charlieCash)
+
+  liveTrades <- query @IRSTrade f.alice
+  assertMsg "exactly one live trade (the novated one)" (length liveTrades == 1)
+
+-- Novation decline: Charlie rejects, so the ORIGINAL trade is recreated
+-- (new contract id, same parties) rather than left stranded -- and it's
+-- still fully live/settleable afterward.
+testNovationRejectRestoresTrade : Script ()
+testNovationRejectRestoresTrade = do
+  f <- setupTrade 1000000.0 1000000.0
+  charlie <- allocateParty "Charlie"
+
+  proposalCid <- submit f.bob do
+    exerciseCmd f.tradeCid ProposeNovation with transferor = f.bob; transferee = charlie
+
+  restoredCid <- submit charlie do
+    exerciseCmd proposalCid RejectNovation
+
+  Some trade <- queryContractId f.alice restoredCid
+  assertMsg "fixedRatePayer unchanged" (trade.fixedRatePayer == f.alice)
+  assertMsg "floatingRatePayer restored to Bob" (trade.floatingRatePayer == f.bob)
+
+  res <- submit f.oracle do
+    exerciseCmd restoredCid SettlePeriod with periodEnd = date 2026 Oct 20; observedRate = 0.035
+  case res of
+    Left _ -> abort "expected restored trade to still settle"
+    Right _ -> pure ()
+
+-- Guard: only an actual party to the trade can propose to step out.
+testNovationTransferorMustBeTradeParty : Script ()
+testNovationTransferorMustBeTradeParty = do
+  f <- setupTrade 1000000.0 1000000.0
+  charlie <- allocateParty "Charlie"
+  submitMustFail f.oracle do
+    exerciseCmd f.tradeCid ProposeNovation with transferor = f.oracle; transferee = charlie
+
+-- Guard: the transferee can't already be a party to the trade.
+testNovationTransfereeMustNotAlreadyBeParty : Script ()
+testNovationTransfereeMustNotAlreadyBeParty = do
+  f <- setupTrade 1000000.0 1000000.0
+  submitMustFail f.bob do
+    exerciseCmd f.tradeCid ProposeNovation with transferor = f.bob; transferee = f.alice
+
+-- Authorization guard: only the transferee -- not the remaining
+-- counterparty -- can accept (or reject) a novation proposal, even though
+-- the remaining party is a signatory (and so can see) the proposal.
+testOnlyTransfereeCanAcceptNovation : Script ()
+testOnlyTransfereeCanAcceptNovation = do
+  f <- setupTrade 1000000.0 1000000.0
+  bank <- allocateParty "Bank"
+  charlie <- allocateParty "Charlie"
+  charlieCash <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = charlie; label = "Charlie-USD"; currency = USD; amount = 1000000.0; observers = [f.oracle]
+  proposalCid <- submit f.bob do
+    exerciseCmd f.tradeCid ProposeNovation with transferor = f.bob; transferee = charlie
+  submitMustFail f.alice do
+    exerciseCmd proposalCid AcceptNovation with transfereeCashCid = charlieCash
+
+-- Termination happy path: Alice proposes to end the trade; Bob accepts.
+-- No successor contract -- the trade is simply gone.
+testTerminationAcceptEndsTrade : Script ()
+testTerminationAcceptEndsTrade = do
+  f <- setupTrade 1000000.0 1000000.0
+  proposalCid <- submit f.alice do
+    exerciseCmd f.tradeCid ProposeTermination with proposer = f.alice
+  submit f.bob do
+    exerciseCmd proposalCid AcceptTermination
+
+  liveTrades <- query @IRSTrade f.alice
+  assertMsg "no live trade after termination" (null liveTrades)
+
+-- Termination decline: Bob rejects, so the ORIGINAL trade is recreated
+-- (new contract id, same terms) rather than left stranded -- and it's
+-- still fully live/settleable afterward.
+testTerminationRejectRestoresTrade : Script ()
+testTerminationRejectRestoresTrade = do
+  f <- setupTrade 1000000.0 1000000.0
+  proposalCid <- submit f.alice do
+    exerciseCmd f.tradeCid ProposeTermination with proposer = f.alice
+
+  restoredCid <- submit f.bob do
+    exerciseCmd proposalCid RejectTermination
+
+  Some trade <- queryContractId f.alice restoredCid
+  assertMsg "fixedRatePayer unchanged" (trade.fixedRatePayer == f.alice)
+  assertMsg "floatingRatePayer unchanged" (trade.floatingRatePayer == f.bob)
+
+  res <- submit f.oracle do
+    exerciseCmd restoredCid SettlePeriod with periodEnd = date 2026 Oct 20; observedRate = 0.035
+  case res of
+    Left _ -> abort "expected restored trade to still settle"
+    Right _ -> pure ()
+
+-- Guard: only an actual party to the trade can propose termination.
+testTerminationProposerMustBeTradeParty : Script ()
+testTerminationProposerMustBeTradeParty = do
+  f <- setupTrade 1000000.0 1000000.0
+  submitMustFail f.oracle do
+    exerciseCmd f.tradeCid ProposeTermination with proposer = f.oracle
+
+-- Authorization guard: only the OTHER party -- not the proposer itself --
+-- can accept (or reject) a termination proposal, even though the proposer
+-- is a signatory (and so can see) the proposal.
+testOnlyOtherPartyCanAcceptTermination : Script ()
+testOnlyOtherPartyCanAcceptTermination = do
+  f <- setupTrade 1000000.0 1000000.0
+  proposalCid <- submit f.alice do
+    exerciseCmd f.tradeCid ProposeTermination with proposer = f.alice
+  submitMustFail f.alice do
+    exerciseCmd proposalCid AcceptTermination

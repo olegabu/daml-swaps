@@ -1,0 +1,443 @@
+module IRS where
+
+import Types
+import Cash
+
+-- ============================================================
+-- Shared DvP helper
+-- ============================================================
+
+-- Attempts to move `amount` of cash from `payer` to the other party, using
+-- the two accounts stored on the trade. Returns:
+--   * Right (newFixedCid, newFloatingCid) on success -- the refreshed cash
+--     contract IDs to store on the recreated trade.
+--   * Left availableBalance when the payer's single account can't cover the
+--     amount -- the caller turns this into a SettlementFailed record rather
+--     than aborting the transaction.
+--
+-- Authorization: this runs inside an IRSTrade choice, so the transaction
+-- already carries fixedRatePayer + floatingRatePayer signatory authority;
+-- the AdjustBalance controller (the account owner, = payer or receiver) is
+-- therefore authorized without either party submitting. Visibility: the
+-- submitter (the oracle) must readAs both parties so both accounts are
+-- fetchable -- see Setup / the JSON API oracle token.
+tryMoveCash
+  :  Party                                  -- payer
+  -> Decimal                                -- amount (must be > 0)
+  -> Party -> Party                         -- fixedRatePayer, floatingRatePayer
+  -> ContractId CashHolding                 -- fixedRatePayer's account
+  -> ContractId CashHolding                 -- floatingRatePayer's account
+  -> Update (Either Decimal (ContractId CashHolding, ContractId CashHolding))
+tryMoveCash payer amount fixedRatePayer floatingRatePayer fixedRatePayerCashCid floatingRatePayerCashCid = do
+  let (payerCid, receiverCid) =
+        if payer == fixedRatePayer
+        then (fixedRatePayerCashCid, floatingRatePayerCashCid)
+        else (floatingRatePayerCashCid, fixedRatePayerCashCid)
+  payerHolding <- fetch payerCid
+  if payerHolding.amount >= amount
+    then do
+      newPayerCid    <- exercise payerCid AdjustBalance with delta = negate amount
+      newReceiverCid <- exercise receiverCid AdjustBalance with delta = amount
+      let refreshed =
+            if payer == fixedRatePayer
+            then (newPayerCid, newReceiverCid)
+            else (newReceiverCid, newPayerCid)
+      pure (Right refreshed)
+    else pure (Left payerHolding.amount)
+
+
+-- ============================================================
+-- Trade execution: propose -> accept
+-- ============================================================
+
+template IRSProposal
+  with
+    proposer       : Party
+    counterparty   : Party
+    oracle         : Party    -- calculation agent: sole submitter of rate/MTM inputs
+    proposerCashCid : ContractId CashHolding   -- proposer's collateral/settlement account
+    notional       : Decimal
+    fixedLeg       : FixedLeg
+    floatingLeg    : FloatingLeg
+    effectiveDate  : Date
+    maturityDate   : Date
+  where
+    signatory proposer
+    observer counterparty, oracle
+
+    ensure notional > 0.0
+        && maturityDate > effectiveDate
+        && fixedLeg.fixedRate >= 0.0 && fixedLeg.fixedRate <= 1.0   -- decimal fraction
+
+    -- Counterparty accepts and names its own settlement account. Each party
+    -- designates its own account up front, mirroring how a CSA names each
+    -- side's collateral account in the trade documentation.
+    choice AcceptIRS : ContractId IRSTrade
+      with
+        counterpartyCashCid : ContractId CashHolding
+      controller counterparty
+      do
+        create IRSTrade with
+          fixedRatePayer = proposer
+          floatingRatePayer = counterparty
+          oracle
+          fixedRatePayerCashCid = proposerCashCid
+          floatingRatePayerCashCid = counterpartyCashCid
+          notional
+          fixedLeg
+          floatingLeg
+          effectiveDate
+          maturityDate
+          lastSettledDate = effectiveDate
+          postedMarginByFixedRatePayer = 0.0
+          postedMarginByFloatingRatePayer = 0.0
+          history = []
+
+    choice RejectIRS : ()
+      controller counterparty
+      do pure ()
+
+
+-- ============================================================
+-- The live trade
+-- ============================================================
+
+template IRSTrade
+  with
+    fixedRatePayer                  : Party                  -- signs the fixed leg
+    floatingRatePayer               : Party                  -- signs the floating leg
+    oracle                          : Party                  -- calculation agent: sole submitter of SettlePeriod/SettleMargin
+    fixedRatePayerCashCid           : ContractId CashHolding  -- kept fresh on every settle
+    floatingRatePayerCashCid        : ContractId CashHolding  -- kept fresh on every settle
+    notional                        : Decimal
+    fixedLeg                        : FixedLeg
+    floatingLeg                     : FloatingLeg
+    effectiveDate                   : Date
+    maturityDate                    : Date
+    lastSettledDate                 : Date  -- start of the next period: effectiveDate until the first SettlePeriod, then that call's periodEnd
+    postedMarginByFixedRatePayer    : Decimal  -- cumulative variation margin posted by fixedRatePayer
+    postedMarginByFloatingRatePayer : Decimal  -- cumulative variation margin posted by floatingRatePayer
+    history                         : [LifecycleEvent]  -- audit trail: settled periods and margin calls, in order
+  where
+    signatory fixedRatePayer, floatingRatePayer
+    observer oracle
+    ensure notional > 0.0
+
+    -- Periodic reset/payment. The oracle submits only the observed floating
+    -- fixing; the contract computes who owes whom and moves the cash
+    -- atomically (DvP) in the same transaction. On success the trade
+    -- continues (Right); if the payer's account can't cover the coupon the
+    -- trade defaults (Left) -- no grace period in this toy model.
+    --
+    -- Day-count fraction is real (Types.daml's dayCountFraction), computed
+    -- from lastSettledDate (this trade's own tracked schedule position, not
+    -- an oracle-submitted claim) to periodEnd, under the fixed leg's
+    -- convention. Simplification: a real IRS could net two legs each
+    -- accruing under its OWN convention; this model computes one net
+    -- difference, so it applies a single convention (fixedLeg's) to that
+    -- net figure. No holiday/business-day adjustment either -- see
+    -- dayCountFraction's comment.
+    choice SettlePeriod : Either (ContractId SettlementFailed) (ContractId IRSTrade)
+      with
+        periodEnd    : Date
+        observedRate : Decimal    -- the floating fixing for this period
+      controller oracle
+      do
+        assertMsg "Period end must not be after maturity"
+          (periodEnd <= maturityDate)
+        assertMsg "Period end must be after the last settled date"
+          (periodEnd > lastSettledDate)
+        -- Rates are decimal fractions (0.03 = 3%). Reject an out-of-band
+        -- fixing so a fat-fingered "3" (= 300%) fails loudly here instead
+        -- of silently defaulting the trade on an impossible payment.
+        assertMsg "observedRate must be a decimal fraction in [0, 1]"
+          (observedRate >= 0.0 && observedRate <= 1.0)
+
+        let dayFraction = dayCountFraction fixedLeg.dayCount lastSettledDate periodEnd
+            rateDiff    = fixedLeg.fixedRate - observedRate
+            rawPayment  = rateDiff * notional * dayFraction
+            amount      = abs rawPayment
+            (payer, receiver) =
+              if rawPayment >= 0.0
+              then (fixedRatePayer, floatingRatePayer)
+              else (floatingRatePayer, fixedRatePayer)
+            record = PeriodRecord with
+              periodEnd
+              observedRate
+              netPayment = amount
+              paidBy = payer
+              paidTo = receiver
+
+        moved <- tryMoveCash payer amount fixedRatePayer floatingRatePayer fixedRatePayerCashCid floatingRatePayerCashCid
+        case moved of
+          Right (newFixedCid, newFloatingCid) -> do
+            tradeCid <- create this with
+              fixedRatePayerCashCid = newFixedCid
+              floatingRatePayerCashCid = newFloatingCid
+              lastSettledDate = periodEnd
+              history = history ++ [PeriodEvent record]
+            pure (Right tradeCid)
+          Left available -> do
+            defCid <- create SettlementFailed with
+              fixedRatePayer; floatingRatePayer
+              defaultingParty = payer
+              amountOwed = amount
+              amountAvailable = available
+              context = "SettlePeriod"
+              history
+            pure (Left defCid)
+
+    -- Variation margin, settled immediately (no raise-then-post gap). The
+    -- oracle submits the current mark-to-market from fixedRatePayer's
+    -- perspective; the contract derives direction and moves cash atomically,
+    -- same DvP as SettlePeriod. Positive MTM favors fixedRatePayer, so
+    -- floatingRatePayer posts to fixedRatePayer; negative is the reverse.
+    choice SettleMargin : Either (ContractId SettlementFailed) (ContractId IRSTrade)
+      with
+        asOf         : Date       -- the date this mark-to-market was struck
+        markToMarket : Decimal
+      controller oracle
+      do
+        assertMsg "Mark-to-market must be nonzero to move margin"
+          (markToMarket /= 0.0)
+        -- Sanity bound: a trade's MTM can't plausibly exceed its notional,
+        -- so reject a fat-fingered value instead of forcing a default.
+        assertMsg "Mark-to-market magnitude must not exceed notional"
+          (abs markToMarket <= notional)
+
+        let amount = abs markToMarket
+            payer  = if markToMarket > 0.0 then floatingRatePayer else fixedRatePayer
+            receiver = if payer == fixedRatePayer then floatingRatePayer else fixedRatePayer
+            record = MarginRecord with
+              asOf
+              markToMarket
+              netPayment = amount
+              paidBy = payer
+              paidTo = receiver
+
+        moved <- tryMoveCash payer amount fixedRatePayer floatingRatePayer fixedRatePayerCashCid floatingRatePayerCashCid
+        case moved of
+          Right (newFixedCid, newFloatingCid) -> do
+            tradeCid <- create this with
+              fixedRatePayerCashCid = newFixedCid
+              floatingRatePayerCashCid = newFloatingCid
+              postedMarginByFixedRatePayer = if payer == fixedRatePayer then postedMarginByFixedRatePayer + amount else postedMarginByFixedRatePayer
+              postedMarginByFloatingRatePayer = if payer == floatingRatePayer then postedMarginByFloatingRatePayer + amount else postedMarginByFloatingRatePayer
+              history = history ++ [MarginEvent record]
+            pure (Right tradeCid)
+          Left available -> do
+            defCid <- create SettlementFailed with
+              fixedRatePayer; floatingRatePayer
+              defaultingParty = payer
+              amountOwed = amount
+              amountAvailable = available
+              context = "SettleMargin"
+              history
+            pure (Left defCid)
+
+    -- Novation, propose-accept (mirrors IRSProposal/AcceptIRS above -- see
+    -- ARCHITECTURE.md, "Propose-accept: carrying authority across
+    -- transactions", for the general pattern). A direct dual-controller
+    -- choice here would force one participant to submit actAs BOTH the
+    -- transferor and transferee -- only possible when they're co-hosted
+    -- on the same node (e.g. a single sandbox/daml repl), never in a real
+    -- deployment where counterparties sit on distinct participants.
+    -- Splitting into two single-party transactions, with authority carried
+    -- forward via NovationProposal's signatories, needs no such co-hosting.
+    --
+    -- Consuming: this transaction already carries both fixedRatePayer's and
+    -- floatingRatePayer's authority -- they're IRSTrade's signatories
+    -- regardless of who the controller is (see ARCHITECTURE.md, "Authority
+    -- vs. visibility") -- so archiving the live trade here doesn't need the
+    -- transferee's consent yet. That consent, or its refusal, is
+    -- exactly what AcceptNovation / RejectNovation resolve below.
+    choice ProposeNovation : ContractId NovationProposal
+      with
+        transferor : Party
+        transferee : Party
+      controller transferor
+      do
+        assertMsg "Transferor must be a party to this trade"
+          (transferor == fixedRatePayer || transferor == floatingRatePayer)
+        assertMsg "Transferee must not already be a party to this trade"
+          (transferee /= fixedRatePayer && transferee /= floatingRatePayer)
+        create NovationProposal with
+          fixedRatePayer; floatingRatePayer; oracle
+          transferor; transferee
+          fixedRatePayerCashCid; floatingRatePayerCashCid
+          notional; fixedLeg; floatingLeg
+          effectiveDate; maturityDate; lastSettledDate
+          postedMarginByFixedRatePayer; postedMarginByFloatingRatePayer
+          history
+
+    -- Early termination, propose-accept -- same shape and same reasoning as
+    -- ProposeNovation above (see ARCHITECTURE.md, "Propose-accept: carrying
+    -- authority across transactions"). The old direct `controller
+    -- fixedRatePayer, floatingRatePayer` choice needed one participant to
+    -- submit actAs both parties at once -- only possible when they're
+    -- co-hosted. Consuming here for the same reason as ProposeNovation:
+    -- this transaction already carries both signatories' authority (it's
+    -- exercised ON IRSTrade), so archiving doesn't need the other party's
+    -- consent yet -- that consent, or its refusal, is exactly what
+    -- AcceptTermination / RejectTermination resolve below.
+    choice ProposeTermination : ContractId TerminationProposal
+      with
+        proposer : Party
+      controller proposer
+      do
+        assertMsg "Proposer must be a party to this trade"
+          (proposer == fixedRatePayer || proposer == floatingRatePayer)
+        let otherParty = if proposer == fixedRatePayer then floatingRatePayer else fixedRatePayer
+        create TerminationProposal with
+          fixedRatePayer; floatingRatePayer; oracle
+          proposer; otherParty
+          fixedRatePayerCashCid; floatingRatePayerCashCid
+          notional; fixedLeg; floatingLeg
+          effectiveDate; maturityDate; lastSettledDate
+          postedMarginByFixedRatePayer; postedMarginByFloatingRatePayer
+          history
+
+
+-- ============================================================
+-- Novation: propose -> accept/reject
+-- ============================================================
+
+-- Carries the ORIGINAL trade's full terms, plus both original signatories'
+-- authority (fixedRatePayer and floatingRatePayer -- see ProposeNovation,
+-- which is exercised ON the live trade and so already has both), forward
+-- to a single later transaction submitted by the transferee alone. That's
+-- what lets AcceptNovation create a trade signed by {remainingParty,
+-- transferee} and, symmetrically, lets RejectNovation recreate the
+-- ORIGINAL trade signed by {fixedRatePayer, floatingRatePayer} -- without
+-- the transferor needing to submit anything a second time.
+template NovationProposal
+  with
+    fixedRatePayer                  : Party  -- original fixedRatePayer (may be transferor or remaining)
+    floatingRatePayer               : Party  -- original floatingRatePayer
+    oracle                          : Party
+    transferor                      : Party  -- must be fixedRatePayer or floatingRatePayer
+    transferee                      : Party  -- proposed replacement; sole controller of accept/reject
+    fixedRatePayerCashCid           : ContractId CashHolding
+    floatingRatePayerCashCid        : ContractId CashHolding
+    notional                        : Decimal
+    fixedLeg                        : FixedLeg
+    floatingLeg                     : FloatingLeg
+    effectiveDate                   : Date
+    maturityDate                    : Date
+    lastSettledDate                 : Date
+    postedMarginByFixedRatePayer    : Decimal
+    postedMarginByFloatingRatePayer : Decimal
+    history                         : [LifecycleEvent]
+  where
+    signatory fixedRatePayer, floatingRatePayer
+    observer transferee, oracle
+
+    -- Transferee accepts and brings its own settlement account, same as
+    -- AcceptIRS does for the original trade.
+    choice AcceptNovation : ContractId IRSTrade
+      with
+        transfereeCashCid : ContractId CashHolding
+      controller transferee
+      do
+        create IRSTrade with
+          fixedRatePayer = if transferor == fixedRatePayer then transferee else fixedRatePayer
+          floatingRatePayer = if transferor == floatingRatePayer then transferee else floatingRatePayer
+          oracle
+          fixedRatePayerCashCid =
+            if transferor == fixedRatePayer then transfereeCashCid else fixedRatePayerCashCid
+          floatingRatePayerCashCid =
+            if transferor == floatingRatePayer then transfereeCashCid else floatingRatePayerCashCid
+          notional; fixedLeg; floatingLeg
+          effectiveDate; maturityDate; lastSettledDate
+          postedMarginByFixedRatePayer; postedMarginByFloatingRatePayer
+          history
+
+    -- Transferee declines. The original trade was already archived when
+    -- this proposal was created (see ProposeNovation), so recreate it
+    -- unchanged (new contract id, same terms) rather than stranding
+    -- fixedRatePayer/floatingRatePayer without a live trade.
+    choice RejectNovation : ContractId IRSTrade
+      controller transferee
+      do
+        create IRSTrade with
+          fixedRatePayer; floatingRatePayer; oracle
+          fixedRatePayerCashCid; floatingRatePayerCashCid
+          notional; fixedLeg; floatingLeg
+          effectiveDate; maturityDate; lastSettledDate
+          postedMarginByFixedRatePayer; postedMarginByFloatingRatePayer
+          history
+
+
+-- ============================================================
+-- Early termination: propose -> accept/reject
+-- ============================================================
+
+-- Same authority-carrying trick as NovationProposal: signed by BOTH
+-- fixedRatePayer and floatingRatePayer (available for free, since
+-- ProposeTermination is exercised on IRSTrade -- see there), so
+-- RejectTermination can recreate the original trade without the proposer
+-- submitting anything a second time.
+template TerminationProposal
+  with
+    fixedRatePayer                  : Party
+    floatingRatePayer               : Party
+    oracle                          : Party
+    proposer                        : Party  -- who proposed ending the trade; audit trail only
+    otherParty                      : Party  -- the remaining party; sole controller of accept/reject
+    fixedRatePayerCashCid           : ContractId CashHolding
+    floatingRatePayerCashCid        : ContractId CashHolding
+    notional                        : Decimal
+    fixedLeg                        : FixedLeg
+    floatingLeg                     : FloatingLeg
+    effectiveDate                   : Date
+    maturityDate                    : Date
+    lastSettledDate                 : Date
+    postedMarginByFixedRatePayer    : Decimal
+    postedMarginByFloatingRatePayer : Decimal
+    history                         : [LifecycleEvent]
+  where
+    signatory fixedRatePayer, floatingRatePayer
+    observer otherParty, oracle
+
+    -- Other party agrees: consuming, no successor -- the trade is over.
+    choice AcceptTermination : ()
+      controller otherParty
+      do pure ()
+
+    -- Other party declines. The original trade was already archived when
+    -- this proposal was created (see ProposeTermination), so recreate it
+    -- unchanged (new contract id, same terms) rather than stranding
+    -- fixedRatePayer/floatingRatePayer without a live trade.
+    choice RejectTermination : ContractId IRSTrade
+      controller otherParty
+      do
+        create IRSTrade with
+          fixedRatePayer; floatingRatePayer; oracle
+          fixedRatePayerCashCid; floatingRatePayerCashCid
+          notional; fixedLeg; floatingLeg
+          effectiveDate; maturityDate; lastSettledDate
+          postedMarginByFixedRatePayer; postedMarginByFloatingRatePayer
+          history
+
+
+-- ============================================================
+-- Terminal state: default
+-- ============================================================
+
+-- Created when a settlement or margin move can't be covered by the
+-- defaulting party's account. Archives the live trade with no IRSTrade
+-- successor, so no further lifecycle choices are possible -- the ledger
+-- enforces the terminal state by construction. In production this would
+-- route into default-management / close-out auction logic; here it just
+-- records the facts.
+template SettlementFailed
+  with
+    fixedRatePayer    : Party
+    floatingRatePayer : Party
+    defaultingParty   : Party
+    amountOwed        : Decimal
+    amountAvailable   : Decimal
+    context           : Text              -- which choice triggered it ("SettlePeriod" / "SettleMargin")
+    history           : [LifecycleEvent]  -- audit trail carried over from the trade
+  where
+    signatory fixedRatePayer, floatingRatePayer

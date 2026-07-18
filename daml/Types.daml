@@ -1,0 +1,107 @@
+module Types where
+
+import DA.Date (subDate, toGregorian, fromMonth)
+
+-- Supporting data types for the IRS contract.
+-- Deliberately mirrors the shape of ISDA CDM's auto-generated data classes
+-- (InterestRatePayout / RateSpecification / FloatingRateOption) in spirit,
+-- simplified for a teaching/dev-bootstrap implementation.
+-- NOT a copy of ISDA/Digital Asset's actual CDM-DAML source.
+
+data DayCountConvention
+  = Act360
+  | Act365
+  | Thirty360
+  deriving (Eq, Show)
+
+-- Converts an elapsed period into a fraction of a year under the given
+-- convention -- the standard building block of
+-- `interest = notional * annualRate * dayCountFraction`. Pure date
+-- arithmetic only: NO holiday calendars or business-day adjustment, so
+-- period boundaries are used exactly as given rather than rolled to the
+-- nearest business day. `Thirty360` is the common US/NASD 30/360 rule
+-- (days-in-month capped at 30 on both ends) -- it doesn't implement every
+-- ISDA month-end edge case (e.g. February's special-cased variants).
+dayCountFraction : DayCountConvention -> Date -> Date -> Decimal
+dayCountFraction convention periodStart periodEnd = case convention of
+  Act360 -> intToDecimal (subDate periodEnd periodStart) / 360.0
+  Act365 -> intToDecimal (subDate periodEnd periodStart) / 365.0
+  Thirty360 ->
+    let (y1, m1, d1) = toGregorian periodStart
+        (y2, m2, d2) = toGregorian periodEnd
+        d1' = min d1 30
+        d2' = if d2 == 31 && d1' == 30 then 30 else d2
+        days = 360 * (y2 - y1) + 30 * (fromMonth m2 - fromMonth m1) + (d2' - d1')
+    in intToDecimal days / 360.0
+
+data Frequency
+  = Monthly
+  | Quarterly
+  | SemiAnnual
+  | Annual
+  deriving (Eq, Show)
+
+-- Settlement currency of a cash account / trade. A closed set rather than
+-- free text, so Navigator (and any client) offers a fixed choice.
+data Currency
+  = USD
+  | EUR
+  deriving (Eq, Show)
+
+-- The floating leg's reference rate index. Likewise a closed set.
+data ReferenceRate
+  = SOFR
+  | LIBOR
+  | EURIBOR
+  deriving (Eq, Show)
+
+-- Mirrors CDM's "FixedRateSpecification". No payer/receiver here, unlike
+-- CDM's real shape -- IRSTrade.fixedRatePayer/floatingRatePayer is the
+-- single source of truth for who pays which leg, so there's nothing to
+-- duplicate (and no risk of the two disagreeing).
+data FixedLeg = FixedLeg
+  with
+    fixedRate : Decimal          -- e.g. 0.04 = 4%
+    dayCount  : DayCountConvention
+    frequency : Frequency
+  deriving (Eq, Show)
+
+-- Mirrors CDM's "FloatingRateSpecification" / "FloatingRateOption". Same
+-- payer/receiver omission as FixedLeg, same reason.
+data FloatingLeg = FloatingLeg
+  with
+    floatingIndex : ReferenceRate
+    spread        : Decimal       -- basis points over/under index, as decimal
+    dayCount      : DayCountConvention
+    frequency     : Frequency
+  deriving (Eq, Show)
+
+-- A single settled/observed period -- mirrors a CDM "ResetEvent" / "PaymentEvent"
+data PeriodRecord = PeriodRecord
+  with
+    periodEnd    : Date
+    observedRate : Decimal
+    netPayment   : Decimal        -- positive = fixed payer owes receiver
+    paidBy       : Party
+    paidTo       : Party
+  deriving (Eq, Show)
+
+-- A single variation-margin call -- mirrors a CDM "TransferEvent" driven by
+-- a mark-to-market rather than a rate fixing.
+data MarginRecord = MarginRecord
+  with
+    asOf         : Date
+    markToMarket : Decimal        -- as submitted: positive favors the fixed-rate payer
+    netPayment   : Decimal        -- abs(markToMarket); the amount actually moved
+    paidBy       : Party
+    paidTo       : Party
+  deriving (Eq, Show)
+
+-- IRSTrade.history holds both settlement kinds in one chronological audit
+-- trail. A closed sum type, not two separate lists, so the trail reads in
+-- the order events actually happened rather than needing to be merged and
+-- re-sorted by the reader.
+data LifecycleEvent
+  = PeriodEvent PeriodRecord
+  | MarginEvent MarginRecord
+  deriving (Eq, Show)
