@@ -7,7 +7,7 @@ ones.
 
 - [x] `daml build` on the modules; fixed compile errors.
 - [x] `Test.daml` using **Daml Script** covering the full happy path
-      (propose → accept → `SettlePeriod` moving cash → `SettleMargin`
+      (propose → accept → `SettleCashflow` moving cash → `SettleMargin`
       moving cash) end-to-end in a `Script`.
 - [x] Negative-path script tests: a party can't self-submit a settlement
       (only the oracle can); insufficient funds → `IRSDefaulted`;
@@ -46,7 +46,7 @@ ones.
 - [ ] Small Node/TS script using `@daml/ledger`:
       - Query the live `IRSTrade` and both `CashHolding` balances.
       - Stream the trade via WebSocket and log settlement/margin events.
-- [ ] An oracle-role script: submit `SettlePeriod` / `SettleMargin` and
+- [ ] An oracle-role script: submit `SettleCashflow` / `SettleMargin` and
       observe the atomic cash movement (and the `IRSDefaulted` path).
 
 ## 5. Off-ledger automation stub (the oracle service)
@@ -55,14 +55,14 @@ ones.
       - Queries live `IRSTrade`s.
       - For dev, computes a placeholder rate fixing / mark-to-market
         instead of a real Strata/pricing-engine call.
-      - Submits `SettlePeriod` on schedule and `SettleMargin` on a daily
+      - Submits `SettleCashflow` on schedule and `SettleMargin` on a daily
         (or intraday) mark — the concrete illustration of "nothing fires
         on its own, something has to notice and submit."
 - [ ] Handle the `IRSDefaulted` outcome (alerting / downstream routing).
 
 ## 6. Stretch goals (only after 1–5 are solid)
 
-- [ ] Replace the placeholder `dayFraction` in `SettlePeriod` with real
+- [ ] Replace the placeholder `dayFraction` in `SettleCashflow` with real
       day-count-fraction logic (using the `DayCountConvention`/`Frequency`
       already on the legs).
 - [ ] Model `CashHolding` closer to a real token standard shape (Canton

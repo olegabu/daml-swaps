@@ -27,7 +27,7 @@ setupTrade aliceAmt bobAmt = do
     createCmd CashHolding with issuer = bank; owner = bob; label = "Bob-USD"; currency = USD; amount = bobAmt; observers = [oracle]
 
   proposalCid <- submit alice do
-    createCmd IRSProposal with
+    createCmd TradeProposal with
       proposer = alice
       counterparty = bob
       oracle
@@ -40,7 +40,7 @@ setupTrade aliceAmt bobAmt = do
       effectiveDate = date 2026 Jul 20
       maturityDate = date 2027 Jul 20
 
-  tradeCid <- submit bob do exerciseCmd proposalCid AcceptIRS with counterpartyCashCid = bobCash
+  tradeCid <- submit bob do exerciseCmd proposalCid AcceptTrade with counterpartyCashCid = bobCash
   pure Fixture with alice; bob; oracle; tradeCid
 
 -- Helper: total balance a party can see across their CashHoldings.
@@ -50,9 +50,9 @@ balanceOf p = do
   pure $ sum [c.amount | (_, c) <- holdings, c.owner == p]
 
 -- Direct, ledger-free checks of Types.daml's dayCountFraction. The
--- SettlePeriod tests below only ever hit a round 90/360 = 0.25 span, which
+-- SettleCashflow tests below only ever hit a round 90/360 = 0.25 span, which
 -- wouldn't catch a scaling bug that happens to still land on 0.25. These
--- pin down Act360/Act365 (never otherwise exercised -- SettlePeriod only
+-- pin down Act360/Act365 (never otherwise exercised -- SettleCashflow only
 -- ever reads fixedLeg.dayCount, and the fixture's fixedLeg is Thirty360)
 -- and Thirty360's day-31 capping logic specifically.
 
@@ -86,13 +86,41 @@ testThirty360CapsEndDay31 =
   assertMsg "Thirty360: Jul31 end capped to 30 -> 90/360 = 0.25"
     (dayCountFraction Thirty360 (date 2026 Apr 30) (date 2026 Jul 31) == 0.25)
 
+-- Counterparty can decline the initial trade proposal. No IRSTrade should
+-- ever come into existence -- RejectTrade is a plain archive, no successor.
+testRejectTradeDeclinesProposal : Script ()
+testRejectTradeDeclinesProposal = do
+  bank   <- allocateParty "Bank"
+  alice  <- allocateParty "Alice"
+  bob    <- allocateParty "Bob"
+  oracle <- allocateParty "Oracle"
+  aliceCash <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = alice; label = "Alice-USD"; currency = USD; amount = 1000000.0; observers = [oracle]
+
+  proposalCid <- submit alice do
+    createCmd TradeProposal with
+      proposer = alice
+      counterparty = bob
+      oracle
+      proposerCashCid = aliceCash
+      notional = 10000000.0
+      fixedLeg = FixedLeg with fixedRate = 0.04; dayCount = Thirty360; frequency = Quarterly
+      floatingLeg = FloatingLeg with floatingIndex = SOFR; spread = 0.0; dayCount = Act360; frequency = Quarterly
+      effectiveDate = date 2026 Jul 20
+      maturityDate = date 2027 Jul 20
+
+  submit bob do exerciseCmd proposalCid RejectTrade
+
+  trades <- query @IRSTrade alice
+  assertMsg "no trade created after rejection" (null trades)
+
 -- Happy path: oracle settles a period below the fixed rate, so Alice (fixed
 -- payer) owes Bob. 0.04 - 0.035 = 0.005 * 10M * 0.25 = 12,500.
-testSettlePeriodMovesCash : Script ()
-testSettlePeriodMovesCash = do
+testSettleCashflowMovesCash : Script ()
+testSettleCashflowMovesCash = do
   f <- setupTrade 1000000.0 1000000.0
   res <- submit f.oracle do
-    exerciseCmd f.tradeCid SettlePeriod with periodEnd = date 2026 Oct 20; observedRate = 0.035
+    exerciseCmd f.tradeCid SettleCashflow with periodEnd = date 2026 Oct 20; observedRate = 0.035
   case res of
     Left _ -> abort "expected trade to continue, got default"
     Right _ -> pure ()
@@ -102,8 +130,8 @@ testSettlePeriodMovesCash = do
   assertMsg "Bob credited 12500" (bobBal == 1012500.0)
 
 -- Margin: positive MTM favors Alice, so Bob posts to Alice. Also checks the
--- margin call lands on `history` as a MarginEvent -- same list SettlePeriod
--- appends PeriodEvents to (see Types.daml's LifecycleEvent).
+-- margin call lands on `history` as a MarginEvent -- same list SettleCashflow
+-- appends CashflowEvents to (see Types.daml's LifecycleEvent).
 testSettleMarginMovesCash : Script ()
 testSettleMarginMovesCash = do
   f <- setupTrade 1000000.0 1000000.0
@@ -127,22 +155,22 @@ testSettleMarginMovesCash = do
     _ -> abort "expected exactly one MarginEvent in history"
 
 -- History is one ordered trail across both event kinds: a period settle
--- followed by a margin call appends a PeriodEvent then a MarginEvent, in
+-- followed by a margin call appends a CashflowEvent then a MarginEvent, in
 -- that order, on the same `history` list.
 testHistoryOrdersMixedEvents : Script ()
 testHistoryOrdersMixedEvents = do
   f <- setupTrade 1000000.0 1000000.0
   Right afterPeriod <- submit f.oracle do
-    exerciseCmd f.tradeCid SettlePeriod with periodEnd = date 2026 Oct 20; observedRate = 0.035
+    exerciseCmd f.tradeCid SettleCashflow with periodEnd = date 2026 Oct 20; observedRate = 0.035
   Right afterMargin <- submit f.oracle do
     exerciseCmd afterPeriod SettleMargin with asOf = date 2026 Jul 21; markToMarket = 50000.0
 
   Some trade <- queryContractId f.alice afterMargin
   case trade.history of
-    [PeriodEvent _, MarginEvent _] -> pure ()
-    _ -> abort "expected [PeriodEvent, MarginEvent] in that order"
+    [CashflowEvent _, MarginEvent _] -> pure ()
+    _ -> abort "expected [CashflowEvent, MarginEvent] in that order"
 
--- Default: Bob owes a margin he can't cover -> SettlementFailed, no live trade.
+-- Default: Bob owes a margin he can't cover -> SettlementFailure, no live trade.
 testInsufficientDefaults : Script ()
 testInsufficientDefaults = do
   f <- setupTrade 1000000.0 10000.0   -- Bob only has 10k
@@ -160,12 +188,32 @@ testInsufficientDefaults = do
   trades <- query @IRSTrade f.alice
   assertMsg "no live trade after default" (null trades)
 
+-- Default via SettleCashflow specifically (not just SettleMargin, which
+-- shares most of the same tryMoveCash machinery but builds its own
+-- SettlementFailure record): Alice can't cover the period coupon she owes.
+-- 0.04 - 0.01 = 0.03 * 10M * 0.25 = 75,000, well above her 1,000 balance.
+testSettleCashflowInsufficientDefaults : Script ()
+testSettleCashflowInsufficientDefaults = do
+  f <- setupTrade 1000.0 1000000.0   -- Alice only has 1,000
+  res <- submit f.oracle do
+    exerciseCmd f.tradeCid SettleCashflow with periodEnd = date 2026 Oct 20; observedRate = 0.01
+  case res of
+    Right _ -> abort "expected default, got a live trade"
+    Left defCid -> do
+      Some d <- queryContractId f.alice defCid
+      assertMsg "defaulting party is Alice" (d.defaultingParty == f.alice)
+      assertMsg "amount owed 75000" (d.amountOwed == 75000.0)
+      assertMsg "amount available 1000" (d.amountAvailable == 1000.0)
+      assertMsg "context is SettleCashflow" (d.context == "SettleCashflow")
+  trades <- query @IRSTrade f.alice
+  assertMsg "no live trade after default" (null trades)
+
 -- Authorization guard: a counterparty cannot self-submit a settlement.
 testPartyCannotSettle : Script ()
 testPartyCannotSettle = do
   f <- setupTrade 1000000.0 1000000.0
   submitMustFail f.alice do
-    exerciseCmd f.tradeCid SettlePeriod with periodEnd = date 2026 Oct 20; observedRate = 0.035
+    exerciseCmd f.tradeCid SettleCashflow with periodEnd = date 2026 Oct 20; observedRate = 0.035
 
 -- Authorization guard: a counterparty cannot adjust its own cash account
 -- directly (would let it mint into / drain its own balance out-of-band, and
@@ -191,7 +239,7 @@ testRateOutOfBandRejected : Script ()
 testRateOutOfBandRejected = do
   f <- setupTrade 1000000.0 1000000.0
   submitMustFail f.oracle do
-    exerciseCmd f.tradeCid SettlePeriod with periodEnd = date 2026 Oct 20; observedRate = 3.0
+    exerciseCmd f.tradeCid SettleCashflow with periodEnd = date 2026 Oct 20; observedRate = 3.0
 
 -- Sanity guard: a mark-to-market above notional is rejected.
 testMtmAboveNotionalRejected : Script ()
@@ -207,7 +255,7 @@ testPeriodEndMustBeAfterLastSettled : Script ()
 testPeriodEndMustBeAfterLastSettled = do
   f <- setupTrade 1000000.0 1000000.0
   submitMustFail f.oracle do
-    exerciseCmd f.tradeCid SettlePeriod with periodEnd = date 2026 Jul 20; observedRate = 0.035
+    exerciseCmd f.tradeCid SettleCashflow with periodEnd = date 2026 Jul 20; observedRate = 0.035
 
 -- The trade tracks its own schedule position (lastSettledDate), not the
 -- oracle's word for it: settling Q1 (Jul 20 -> Oct 20) advances it to
@@ -220,24 +268,25 @@ testSecondPeriodUsesLastSettledDate : Script ()
 testSecondPeriodUsesLastSettledDate = do
   f <- setupTrade 1000000.0 1000000.0
   Right afterQ1 <- submit f.oracle do
-    exerciseCmd f.tradeCid SettlePeriod with periodEnd = date 2026 Oct 20; observedRate = 0.035
+    exerciseCmd f.tradeCid SettleCashflow with periodEnd = date 2026 Oct 20; observedRate = 0.035
 
   submitMustFail f.oracle do
-    exerciseCmd afterQ1 SettlePeriod with periodEnd = date 2026 Oct 20; observedRate = 0.035
+    exerciseCmd afterQ1 SettleCashflow with periodEnd = date 2026 Oct 20; observedRate = 0.035
 
   res <- submit f.oracle do
-    exerciseCmd afterQ1 SettlePeriod with periodEnd = date 2027 Jan 20; observedRate = 0.035
+    exerciseCmd afterQ1 SettleCashflow with periodEnd = date 2027 Jan 20; observedRate = 0.035
   case res of
     Left _ -> abort "expected Q2 to settle, got default"
     Right _ -> pure ()
   aliceBal <- balanceOf f.alice
   assertMsg "Alice debited 12500 twice (Q1 + Q2)" (aliceBal == 975000.0)
 
--- Novation happy path: Bob proposes to step out for Charlie; Charlie
--- accepts, bringing his own account. New trade has Charlie in Bob's slot,
--- and the old trade no longer exists.
-testNovationAcceptReplacesParty : Script ()
-testNovationAcceptReplacesParty = do
+-- Tri-party novation happy path: Bob proposes to step out for Charlie;
+-- Charlie accepts, bringing his own account -- but that's only two of the
+-- three consents. Alice (the remaining party) still has to confirm before
+-- the novated trade actually exists.
+testNovationConfirmReplacesParty : Script ()
+testNovationConfirmReplacesParty = do
   f <- setupTrade 1000000.0 1000000.0
   bank <- allocateParty "Bank"
   charlie <- allocateParty "Charlie"
@@ -247,8 +296,11 @@ testNovationAcceptReplacesParty = do
   proposalCid <- submit f.bob do
     exerciseCmd f.tradeCid ProposeNovation with transferor = f.bob; transferee = charlie
 
-  newTradeCid <- submit charlie do
+  confirmationCid <- submit charlie do
     exerciseCmd proposalCid AcceptNovation with transfereeCashCid = charlieCash
+
+  newTradeCid <- submit f.alice do
+    exerciseCmd confirmationCid ConfirmNovation
 
   Some trade <- queryContractId f.alice newTradeCid
   assertMsg "fixedRatePayer unchanged" (trade.fixedRatePayer == f.alice)
@@ -257,6 +309,106 @@ testNovationAcceptReplacesParty = do
 
   liveTrades <- query @IRSTrade f.alice
   assertMsg "exactly one live trade (the novated one)" (length liveTrades == 1)
+
+-- The transferee accepting is NOT enough by itself: it's genuinely a
+-- three-consent flow, so after AcceptNovation (before ConfirmNovation) no
+-- IRSTrade exists at all yet -- the trade is in limbo pending the
+-- remaining party's decision, not already novated with Alice just not
+-- having "seen" it yet.
+testNovationAcceptAloneDoesNotCreateTrade : Script ()
+testNovationAcceptAloneDoesNotCreateTrade = do
+  f <- setupTrade 1000000.0 1000000.0
+  bank <- allocateParty "Bank"
+  charlie <- allocateParty "Charlie"
+  charlieCash <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = charlie; label = "Charlie-USD"; currency = USD; amount = 1000000.0; observers = [f.oracle]
+
+  proposalCid <- submit f.bob do
+    exerciseCmd f.tradeCid ProposeNovation with transferor = f.bob; transferee = charlie
+  _ <- submit charlie do
+    exerciseCmd proposalCid AcceptNovation with transfereeCashCid = charlieCash
+
+  liveTrades <- query @IRSTrade f.alice
+  assertMsg "no live IRSTrade until the remaining party confirms" (null liveTrades)
+
+-- Tri-party veto: even after Charlie has already accepted, Alice (the
+-- remaining party) can still decline -- novating changes whose credit risk
+-- she carries, so she gets the final word. The ORIGINAL trade is recreated
+-- rather than left stranded, same as an outright RejectNovation.
+testNovationDeclineRestoresTrade : Script ()
+testNovationDeclineRestoresTrade = do
+  f <- setupTrade 1000000.0 1000000.0
+  bank <- allocateParty "Bank"
+  charlie <- allocateParty "Charlie"
+  charlieCash <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = charlie; label = "Charlie-USD"; currency = USD; amount = 1000000.0; observers = [f.oracle]
+
+  proposalCid <- submit f.bob do
+    exerciseCmd f.tradeCid ProposeNovation with transferor = f.bob; transferee = charlie
+  confirmationCid <- submit charlie do
+    exerciseCmd proposalCid AcceptNovation with transfereeCashCid = charlieCash
+
+  restoredCid <- submit f.alice do
+    exerciseCmd confirmationCid DeclineNovation
+
+  Some trade <- queryContractId f.alice restoredCid
+  assertMsg "fixedRatePayer unchanged" (trade.fixedRatePayer == f.alice)
+  assertMsg "floatingRatePayer restored to Bob" (trade.floatingRatePayer == f.bob)
+
+  res <- submit f.oracle do
+    exerciseCmd restoredCid SettleCashflow with periodEnd = date 2026 Oct 20; observedRate = 0.035
+  case res of
+    Left _ -> abort "expected restored trade to still settle"
+    Right _ -> pure ()
+
+-- Authorization guard: only the remaining party -- not the transferor or
+-- transferee, both of whom already consented -- can confirm or decline.
+testOnlyRemainingPartyCanConfirmNovation : Script ()
+testOnlyRemainingPartyCanConfirmNovation = do
+  f <- setupTrade 1000000.0 1000000.0
+  bank <- allocateParty "Bank"
+  charlie <- allocateParty "Charlie"
+  charlieCash <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = charlie; label = "Charlie-USD"; currency = USD; amount = 1000000.0; observers = [f.oracle]
+  proposalCid <- submit f.bob do
+    exerciseCmd f.tradeCid ProposeNovation with transferor = f.bob; transferee = charlie
+  confirmationCid <- submit charlie do
+    exerciseCmd proposalCid AcceptNovation with transfereeCashCid = charlieCash
+
+  submitMustFail f.bob do exerciseCmd confirmationCid ConfirmNovation
+  submitMustFail charlie do exerciseCmd confirmationCid ConfirmNovation
+
+-- Confirms the transferee's account is genuinely wired in after a full
+-- tri-party novation, not just structurally present as a field on the
+-- recreated IRSTrade: a real SettleMargin call afterward must move cash
+-- through Charlie's own account correctly, both directions (credit and
+-- debit).
+testSettleAfterNovationMovesCash : Script ()
+testSettleAfterNovationMovesCash = do
+  f <- setupTrade 1000000.0 1000000.0
+  bank <- allocateParty "Bank"
+  charlie <- allocateParty "Charlie"
+  charlieCash <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = charlie; label = "Charlie-USD"; currency = USD; amount = 1000000.0; observers = [f.oracle]
+
+  proposalCid <- submit f.bob do
+    exerciseCmd f.tradeCid ProposeNovation with transferor = f.bob; transferee = charlie
+  confirmationCid <- submit charlie do
+    exerciseCmd proposalCid AcceptNovation with transfereeCashCid = charlieCash
+  newTradeCid <- submit f.alice do
+    exerciseCmd confirmationCid ConfirmNovation
+
+  -- Positive MTM favors Alice (fixedRatePayer), so Charlie (now
+  -- floatingRatePayer) posts to her.
+  res <- submit f.oracle do
+    exerciseCmd newTradeCid SettleMargin with asOf = date 2026 Oct 21; markToMarket = 40000.0
+  case res of
+    Left _ -> abort "expected trade to continue, got default"
+    Right _ -> pure ()
+  aliceBal <- balanceOf f.alice
+  charlieBal <- balanceOf charlie
+  assertMsg "Alice credited 40000" (aliceBal == 1040000.0)
+  assertMsg "Charlie debited 40000 through his own account" (charlieBal == 960000.0)
 
 -- Novation decline: Charlie rejects, so the ORIGINAL trade is recreated
 -- (new contract id, same parties) rather than left stranded -- and it's
@@ -277,7 +429,7 @@ testNovationRejectRestoresTrade = do
   assertMsg "floatingRatePayer restored to Bob" (trade.floatingRatePayer == f.bob)
 
   res <- submit f.oracle do
-    exerciseCmd restoredCid SettlePeriod with periodEnd = date 2026 Oct 20; observedRate = 0.035
+    exerciseCmd restoredCid SettleCashflow with periodEnd = date 2026 Oct 20; observedRate = 0.035
   case res of
     Left _ -> abort "expected restored trade to still settle"
     Right _ -> pure ()
@@ -342,7 +494,7 @@ testTerminationRejectRestoresTrade = do
   assertMsg "floatingRatePayer unchanged" (trade.floatingRatePayer == f.bob)
 
   res <- submit f.oracle do
-    exerciseCmd restoredCid SettlePeriod with periodEnd = date 2026 Oct 20; observedRate = 0.035
+    exerciseCmd restoredCid SettleCashflow with periodEnd = date 2026 Oct 20; observedRate = 0.035
   case res of
     Left _ -> abort "expected restored trade to still settle"
     Right _ -> pure ()

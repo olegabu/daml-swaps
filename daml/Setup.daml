@@ -51,7 +51,8 @@ setup = do
       observers = [oracle]
 
   -- Charlie isn't a party to the seeded trade, but gets an account up front
-  -- so he can accept a novation (ProposeNovation / AcceptNovation).
+  -- so he can accept a novation as transferee (ProposeNovation /
+  -- AcceptNovation / ConfirmNovation).
   _ <- submit bank do
     createCmd CashHolding with
       issuer = bank
@@ -66,7 +67,7 @@ setup = do
   -- path a real counterparty negotiation would use. Each party names its
   -- own settlement account.
   proposalCid <- submit alice do
-    createCmd IRSProposal with
+    createCmd TradeProposal with
       proposer = alice
       counterparty = bob
       oracle
@@ -85,6 +86,6 @@ setup = do
       maturityDate = date 2027 Jul 20
 
   _ <- submit bob do
-    exerciseCmd proposalCid AcceptIRS with counterpartyCashCid = bobCash
+    exerciseCmd proposalCid AcceptTrade with counterpartyCashCid = bobCash
 
   pure ()

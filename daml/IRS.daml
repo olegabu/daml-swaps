@@ -12,7 +12,7 @@ import Cash
 --   * Right (newFixedCid, newFloatingCid) on success -- the refreshed cash
 --     contract IDs to store on the recreated trade.
 --   * Left availableBalance when the payer's single account can't cover the
---     amount -- the caller turns this into a SettlementFailed record rather
+--     amount -- the caller turns this into a SettlementFailure record rather
 --     than aborting the transaction.
 --
 -- Authorization: this runs inside an IRSTrade choice, so the transaction
@@ -50,7 +50,7 @@ tryMoveCash payer amount fixedRatePayer floatingRatePayer fixedRatePayerCashCid 
 -- Trade execution: propose -> accept
 -- ============================================================
 
-template IRSProposal
+template TradeProposal
   with
     proposer       : Party
     counterparty   : Party
@@ -72,7 +72,7 @@ template IRSProposal
     -- Counterparty accepts and names its own settlement account. Each party
     -- designates its own account up front, mirroring how a CSA names each
     -- side's collateral account in the trade documentation.
-    choice AcceptIRS : ContractId IRSTrade
+    choice AcceptTrade : ContractId IRSTrade
       with
         counterpartyCashCid : ContractId CashHolding
       controller counterparty
@@ -93,7 +93,7 @@ template IRSProposal
           postedMarginByFloatingRatePayer = 0.0
           history = []
 
-    choice RejectIRS : ()
+    choice RejectTrade : ()
       controller counterparty
       do pure ()
 
@@ -106,7 +106,7 @@ template IRSTrade
   with
     fixedRatePayer                  : Party                  -- signs the fixed leg
     floatingRatePayer               : Party                  -- signs the floating leg
-    oracle                          : Party                  -- calculation agent: sole submitter of SettlePeriod/SettleMargin
+    oracle                          : Party                  -- calculation agent: sole submitter of SettleCashflow/SettleMargin
     fixedRatePayerCashCid           : ContractId CashHolding  -- kept fresh on every settle
     floatingRatePayerCashCid        : ContractId CashHolding  -- kept fresh on every settle
     notional                        : Decimal
@@ -114,7 +114,7 @@ template IRSTrade
     floatingLeg                     : FloatingLeg
     effectiveDate                   : Date
     maturityDate                    : Date
-    lastSettledDate                 : Date  -- start of the next period: effectiveDate until the first SettlePeriod, then that call's periodEnd
+    lastSettledDate                 : Date  -- start of the next period: effectiveDate until the first SettleCashflow, then that call's periodEnd
     postedMarginByFixedRatePayer    : Decimal  -- cumulative variation margin posted by fixedRatePayer
     postedMarginByFloatingRatePayer : Decimal  -- cumulative variation margin posted by floatingRatePayer
     history                         : [LifecycleEvent]  -- audit trail: settled periods and margin calls, in order
@@ -137,7 +137,7 @@ template IRSTrade
     -- difference, so it applies a single convention (fixedLeg's) to that
     -- net figure. No holiday/business-day adjustment either -- see
     -- dayCountFraction's comment.
-    choice SettlePeriod : Either (ContractId SettlementFailed) (ContractId IRSTrade)
+    choice SettleCashflow : Either (ContractId SettlementFailure) (ContractId IRSTrade)
       with
         periodEnd    : Date
         observedRate : Decimal    -- the floating fixing for this period
@@ -161,7 +161,7 @@ template IRSTrade
               if rawPayment >= 0.0
               then (fixedRatePayer, floatingRatePayer)
               else (floatingRatePayer, fixedRatePayer)
-            record = PeriodRecord with
+            record = CashflowRecord with
               periodEnd
               observedRate
               netPayment = amount
@@ -175,24 +175,24 @@ template IRSTrade
               fixedRatePayerCashCid = newFixedCid
               floatingRatePayerCashCid = newFloatingCid
               lastSettledDate = periodEnd
-              history = history ++ [PeriodEvent record]
+              history = history ++ [CashflowEvent record]
             pure (Right tradeCid)
           Left available -> do
-            defCid <- create SettlementFailed with
+            defCid <- create SettlementFailure with
               fixedRatePayer; floatingRatePayer
               defaultingParty = payer
               amountOwed = amount
               amountAvailable = available
-              context = "SettlePeriod"
+              context = "SettleCashflow"
               history
             pure (Left defCid)
 
     -- Variation margin, settled immediately (no raise-then-post gap). The
     -- oracle submits the current mark-to-market from fixedRatePayer's
     -- perspective; the contract derives direction and moves cash atomically,
-    -- same DvP as SettlePeriod. Positive MTM favors fixedRatePayer, so
+    -- same DvP as SettleCashflow. Positive MTM favors fixedRatePayer, so
     -- floatingRatePayer posts to fixedRatePayer; negative is the reverse.
-    choice SettleMargin : Either (ContractId SettlementFailed) (ContractId IRSTrade)
+    choice SettleMargin : Either (ContractId SettlementFailure) (ContractId IRSTrade)
       with
         asOf         : Date       -- the date this mark-to-market was struck
         markToMarket : Decimal
@@ -226,7 +226,7 @@ template IRSTrade
               history = history ++ [MarginEvent record]
             pure (Right tradeCid)
           Left available -> do
-            defCid <- create SettlementFailed with
+            defCid <- create SettlementFailure with
               fixedRatePayer; floatingRatePayer
               defaultingParty = payer
               amountOwed = amount
@@ -235,7 +235,7 @@ template IRSTrade
               history
             pure (Left defCid)
 
-    -- Novation, propose-accept (mirrors IRSProposal/AcceptIRS above -- see
+    -- Novation, propose-accept (mirrors TradeProposal/AcceptTrade above -- see
     -- ARCHITECTURE.md, "Propose-accept: carrying authority across
     -- transactions", for the general pattern). A direct dual-controller
     -- choice here would force one participant to submit actAs BOTH the
@@ -261,9 +261,10 @@ template IRSTrade
           (transferor == fixedRatePayer || transferor == floatingRatePayer)
         assertMsg "Transferee must not already be a party to this trade"
           (transferee /= fixedRatePayer && transferee /= floatingRatePayer)
+        let remainingParty = if transferor == fixedRatePayer then floatingRatePayer else fixedRatePayer
         create NovationProposal with
           fixedRatePayer; floatingRatePayer; oracle
-          transferor; transferee
+          transferor; transferee; remainingParty
           fixedRatePayerCashCid; floatingRatePayerCashCid
           notional; fixedLeg; floatingLeg
           effectiveDate; maturityDate; lastSettledDate
@@ -299,17 +300,21 @@ template IRSTrade
 
 
 -- ============================================================
--- Novation: propose -> accept/reject
+-- Novation: propose -> accept/reject -> confirm/decline (tri-party)
 -- ============================================================
 
 -- Carries the ORIGINAL trade's full terms, plus both original signatories'
 -- authority (fixedRatePayer and floatingRatePayer -- see ProposeNovation,
 -- which is exercised ON the live trade and so already has both), forward
--- to a single later transaction submitted by the transferee alone. That's
--- what lets AcceptNovation create a trade signed by {remainingParty,
--- transferee} and, symmetrically, lets RejectNovation recreate the
--- ORIGINAL trade signed by {fixedRatePayer, floatingRatePayer} -- without
--- the transferor needing to submit anything a second time.
+-- to a single later transaction submitted by the transferee alone. Real
+-- ISDA novations are tri-party -- they also need the REMAINING party's
+-- consent, since novating changes who they face for counterparty credit
+-- risk. So accepting here doesn't finish the novation: AcceptNovation
+-- creates a NovationConfirmation (below) that locks in the transferee's
+-- consent + account and waits for remainingParty's own choice --
+-- ConfirmNovation or DeclineNovation. RejectNovation stays here, on
+-- NovationProposal, for the transferee declining to join at all -- no
+-- reason to bother the remaining party if the transferee never accepts.
 template NovationProposal
   with
     fixedRatePayer                  : Party  -- original fixedRatePayer (may be transferor or remaining)
@@ -317,6 +322,7 @@ template NovationProposal
     oracle                          : Party
     transferor                      : Party  -- must be fixedRatePayer or floatingRatePayer
     transferee                      : Party  -- proposed replacement; sole controller of accept/reject
+    remainingParty                  : Party  -- whichever of fixedRatePayer/floatingRatePayer isn't transferor
     fixedRatePayerCashCid           : ContractId CashHolding
     floatingRatePayerCashCid        : ContractId CashHolding
     notional                        : Decimal
@@ -333,11 +339,78 @@ template NovationProposal
     observer transferee, oracle
 
     -- Transferee accepts and brings its own settlement account, same as
-    -- AcceptIRS does for the original trade.
-    choice AcceptNovation : ContractId IRSTrade
+    -- AcceptTrade does for the original trade -- but this only locks in
+    -- the transferee's side. See NovationConfirmation for why this can't
+    -- create the final IRSTrade directly.
+    choice AcceptNovation : ContractId NovationConfirmation
       with
         transfereeCashCid : ContractId CashHolding
       controller transferee
+      do
+        create NovationConfirmation with
+          fixedRatePayer; floatingRatePayer; oracle
+          transferor; transferee; remainingParty
+          transfereeCashCid
+          fixedRatePayerCashCid; floatingRatePayerCashCid
+          notional; fixedLeg; floatingLeg
+          effectiveDate; maturityDate; lastSettledDate
+          postedMarginByFixedRatePayer; postedMarginByFloatingRatePayer
+          history
+
+    -- Transferee declines. The original trade was already archived when
+    -- this proposal was created (see ProposeNovation), so recreate it
+    -- unchanged (new contract id, same terms) rather than stranding
+    -- fixedRatePayer/floatingRatePayer without a live trade.
+    choice RejectNovation : ContractId IRSTrade
+      controller transferee
+      do
+        create IRSTrade with
+          fixedRatePayer; floatingRatePayer; oracle
+          fixedRatePayerCashCid; floatingRatePayerCashCid
+          notional; fixedLeg; floatingLeg
+          effectiveDate; maturityDate; lastSettledDate
+          postedMarginByFixedRatePayer; postedMarginByFloatingRatePayer
+          history
+
+
+-- Locks in the transferor's AND transferee's consent (transferee's, via
+-- AcceptNovation's own authority; transferor's, carried forward from
+-- NovationProposal's signatories, which already includes it -- see
+-- ProposeNovation), and waits on the remaining party's final say. Signed
+-- by all three -- {fixedRatePayer, floatingRatePayer} (= {transferor,
+-- remainingParty}) plus transferee, the AcceptNovation choice's own
+-- controller -- so whichever way remainingParty decides, no one else
+-- needs to submit anything again: ConfirmNovation creates the novated
+-- trade signed by {remainingParty, transferee}; DeclineNovation recreates
+-- the ORIGINAL trade signed by {transferor, remainingParty}, exactly
+-- like NovationProposal.RejectNovation does for an earlier decline.
+template NovationConfirmation
+  with
+    fixedRatePayer                  : Party
+    floatingRatePayer               : Party
+    oracle                          : Party
+    transferor                      : Party
+    transferee                      : Party
+    remainingParty                  : Party  -- sole controller of confirm/decline
+    transfereeCashCid               : ContractId CashHolding
+    fixedRatePayerCashCid           : ContractId CashHolding  -- ORIGINAL accounts, for a decline
+    floatingRatePayerCashCid        : ContractId CashHolding
+    notional                        : Decimal
+    fixedLeg                        : FixedLeg
+    floatingLeg                     : FloatingLeg
+    effectiveDate                   : Date
+    maturityDate                    : Date
+    lastSettledDate                 : Date
+    postedMarginByFixedRatePayer    : Decimal
+    postedMarginByFloatingRatePayer : Decimal
+    history                         : [LifecycleEvent]
+  where
+    signatory fixedRatePayer, floatingRatePayer, transferee
+    observer oracle
+
+    -- Remaining party blesses the transferee as its new counterparty.
+    choice ConfirmNovation : ContractId IRSTrade
+      controller remainingParty
       do
         create IRSTrade with
           fixedRatePayer = if transferor == fixedRatePayer then transferee else fixedRatePayer
@@ -352,12 +425,12 @@ template NovationProposal
           postedMarginByFixedRatePayer; postedMarginByFloatingRatePayer
           history
 
-    -- Transferee declines. The original trade was already archived when
-    -- this proposal was created (see ProposeNovation), so recreate it
-    -- unchanged (new contract id, same terms) rather than stranding
-    -- fixedRatePayer/floatingRatePayer without a live trade.
-    choice RejectNovation : ContractId IRSTrade
-      controller transferee
+    -- Remaining party vetoes -- even though the transferee already
+    -- accepted, novating still changes whose credit risk the remaining
+    -- party carries, and they get the final word. Recreate the ORIGINAL
+    -- trade rather than stranding it.
+    choice DeclineNovation : ContractId IRSTrade
+      controller remainingParty
       do
         create IRSTrade with
           fixedRatePayer; floatingRatePayer; oracle
@@ -430,14 +503,14 @@ template TerminationProposal
 -- enforces the terminal state by construction. In production this would
 -- route into default-management / close-out auction logic; here it just
 -- records the facts.
-template SettlementFailed
+template SettlementFailure
   with
     fixedRatePayer    : Party
     floatingRatePayer : Party
     defaultingParty   : Party
     amountOwed        : Decimal
     amountAvailable   : Decimal
-    context           : Text              -- which choice triggered it ("SettlePeriod" / "SettleMargin")
+    context           : Text              -- which choice triggered it ("SettleCashflow" / "SettleMargin")
     history           : [LifecycleEvent]  -- audit trail carried over from the trade
   where
     signatory fixedRatePayer, floatingRatePayer

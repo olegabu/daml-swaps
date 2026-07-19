@@ -42,7 +42,7 @@ template CashHolding
     -- Navigator) fails authorization because the oracle's authority is
     -- missing. The balance only ever changes inside an IRSTrade settlement,
     -- where the trade already carries the owner's signatory authority AND the
-    -- oracle is the controller of SettlePeriod/SettleMargin -- so both
+    -- oracle is the controller of SettleCashflow/SettleMargin -- so both
     -- required authorities are present together, and nowhere else. Keeping
     -- the owner from adjusting on its own also stops the account being
     -- archived out-of-band, which would strand the contract id the trade

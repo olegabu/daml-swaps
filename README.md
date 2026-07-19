@@ -3,7 +3,7 @@
 ## What this is
 
 A learning/prototyping project: an Interest Rate Swap (IRS) modeled as DAML
-smart contracts, intended to run on Canton, plus supporting client code.
+smart contracts, intended to run on Canton.
 The code is intentionally close to real derivatives lifecycle mechanics: execution,
 periodic settlement, variation margin, novation, and termination — with
 settlement modeled as **atomic delivery-versus-payment (DvP)**: cash moves
@@ -13,13 +13,9 @@ off-ledger step.
 ## Roles
 
 - **`fixedRatePayer` / `floatingRatePayer`** — the two trade counterparties,
-  named for which leg each one pays (an ISDA-confirmation-style defined
-  term, not an invented label). Signatories of the trade; they cannot move
-  cash — their own or each other's — outside a settlement (moving a
-  `CashHolding` requires the oracle to co-authorize), and they cannot
-  trigger settlement themselves.
+  named for which leg each one pays. Signatories of the trade.
 - **Oracle** — the calculation/settlement agent. The *sole* controller of
-  `SettlePeriod` and `SettleMargin`. It submits only objective external
+  `SettleCashflow` and `SettleMargin`. It submits only objective external
   numbers (a rate fixing, a mark-to-market); it never names a party or a
   contract ID, so it stays oblivious to counterparty identities. The
   contract derives who owes whom. Observer on the trade and on both cash
@@ -31,10 +27,10 @@ off-ledger step.
 `daml/` contains four modules:
 
 - **`Types.daml`** — supporting data types (FixedLeg, FloatingLeg,
-  PeriodRecord, MarginRecord) plus closed enums `DayCountConvention`,
+  CashflowRecord, MarginRecord) plus closed enums `DayCountConvention`,
   `Frequency`, `Currency` (USD/EUR), and `ReferenceRate`
-  (SOFR/LIBOR/EURIBOR). `LifecycleEvent` is a sum type (`PeriodEvent
-  PeriodRecord | MarginEvent MarginRecord`) letting `IRSTrade.history` hold
+  (SOFR/LIBOR/EURIBOR). `LifecycleEvent` is a sum type (`CashflowEvent
+  CashflowRecord | MarginEvent MarginRecord`) letting `IRSTrade.history` hold
   both differently-shaped audit entries in one chronological list.
   `dayCountFraction` implements `Act360`/`Act365`/`Thirty360` as real date
   arithmetic (no holiday/business-day adjustment). Shaped like ISDA CDM's
@@ -48,29 +44,37 @@ off-ledger step.
   its own account unilaterally — the balance only ever changes inside a
   settlement, where both authorities co-occur.
 - **`IRS.daml`** — the main contract:
-  - `IRSProposal` / `AcceptIRS` / `RejectIRS` — propose-accept execution;
+  - `TradeProposal` / `AcceptTrade` / `RejectTrade` — propose-accept execution;
     each party names its own settlement account.
   - `IRSTrade` — the live, dual-signatory contract, carrying both parties'
     cash account IDs (kept fresh on every settle).
-  - `SettlePeriod` — oracle submits a `periodEnd` and the floating fixing;
+  - `SettleCashflow` — oracle submits a `periodEnd` and the floating fixing;
     the contract computes the real day-count fraction (`Types.daml`'s
     `dayCountFraction`, from the trade's own tracked `lastSettledDate` to
     `periodEnd`, under the fixed leg's `DayCountConvention`), nets the
     coupon, moves cash atomically (DvP), advances `lastSettledDate`, and
-    appends a `PeriodEvent` to `history`. See the demo's "Periodic
+    appends a `CashflowEvent` to `history`. See the demo's "Periodic
     settlement" section for the math.
   - `SettleMargin` — oracle submits an `asOf` date and the mark-to-market;
     the contract derives direction, moves variation margin atomically, and
-    appends a `MarginEvent` to `history` (same list `SettlePeriod` appends
+    appends a `MarginEvent` to `history` (same list `SettleCashflow` appends
     to — see `Types.daml`'s `LifecycleEvent`). Also bumps
     `postedMarginByFixedRatePayer`/`postedMarginByFloatingRatePayer`, a
     separate *cumulative, non-netted* running total per party — not to be
     confused with the per-call `history` entries.
-  - `ProposeNovation` / `AcceptNovation` / `RejectNovation` — propose-accept
-    novation, named for the ISDA Novation Agreement roles: the
-    **transferor** proposes (controller = transferor alone); the
+  - `ProposeNovation` / `AcceptNovation` / `RejectNovation` /
+    `ConfirmNovation` / `DeclineNovation` — **tri-party** novation, one
+    single-party consent per step, named for the ISDA Novation Agreement
+    roles: the **transferor** proposes (controller = transferor alone); the
     **transferee** then accepts, bringing its own account, or declines
-    (controller = transferee alone).
+    outright (controller = transferee alone); then the **remaining party**
+    — whose counterparty credit risk changes as a result — gets the final
+    say, confirming or declining the now-accepted novation (controller =
+    remaining party alone). `AcceptNovation` doesn't create the novated
+    trade directly — it creates a `NovationConfirmation` awaiting the
+    remaining party's decision. See [ARCHITECTURE.md](ARCHITECTURE.md),
+    "Propose-accept: carrying authority across transactions", for how the
+    authority-carrying trick extends to a third sequential consent.
   - `ProposeTermination` / `AcceptTermination` / `RejectTermination` —
     propose-accept early termination: either party proposes (controller =
     proposer alone); the other party then ends the trade for good, or
@@ -78,7 +82,7 @@ off-ledger step.
     the other party alone). See [ARCHITECTURE.md](ARCHITECTURE.md),
     "Propose-accept: carrying authority across transactions", for why both
     of these replaced a direct dual-controller choice.
-  - `SettlementFailed` — terminal state created when a payer's account can't
+  - `SettlementFailure` — terminal state created when a payer's account can't
     cover what's owed; the trade is archived with no successor, so no
     further lifecycle choices are structurally possible.
 - **`Setup.daml`** — the init-script (wired via `daml.yaml`'s
@@ -88,16 +92,19 @@ off-ledger step.
   observed by the oracle — Charlie's is unattached to any trade, so he can
   accept a novation later with no separate funding step); and strikes a
   live `IRSTrade` via the real propose-accept flow (Alice/Bob only).
-- **`Test.daml`** — Daml Script tests (`daml test`), two kinds: direct,
-  ledger-free unit tests of `dayCountFraction` (`Act360`, `Act365`, and
-  `Thirty360`'s day-31 capping logic specifically — the lifecycle tests
-  below only ever hit a round `90/360 = 0.25` span, which wouldn't catch a
-  scaling bug that happened to still land on `0.25`); and full lifecycle
-  tests: settlement moves cash, margin moves cash, insufficient funds →
-  default, a party can't self-submit, out-of-band rate / oversized MTM are
-  rejected, a stale `periodEnd` is rejected, a second period correctly
-  nets from the advanced `lastSettledDate`, and novation accept/reject/
-  authorization guards.
+- **`Test.daml`** — Daml Script tests (`daml test`, 26 tests), two kinds:
+  direct, ledger-free unit tests of `dayCountFraction` (`Act360`, `Act365`,
+  and `Thirty360`'s); and full lifecycle
+  tests covering every explicit choice at least once — trade
+  proposal/accept/**reject**, settlement moves cash (both `SettleCashflow`
+  and `SettleMargin`), insufficient funds → default (triggered from
+  **both** choices, since each builds its own `SettlementFailure` record), a
+  party can't self-submit, out-of-band rate / oversized MTM are rejected, a
+  stale `periodEnd` is rejected, a second period correctly nets from the
+  advanced `lastSettledDate`, novation and termination accept/reject/
+  authorization guards, and settlement working correctly **after** a
+  novation (proving the transferee's account is genuinely wired in, not
+  just structurally present as a field).
 
 All state changes follow DAML's archive-and-recreate pattern (no in-place
 mutation). See `ARCHITECTURE.md` for why, and for the broader Canton
@@ -135,15 +142,6 @@ the installer didn't (it prints the exact line):
 
 ```sh
 export PATH="$HOME/.daml/bin:$PATH"   # add to ~/.bashrc or ~/.zshrc
-```
-
-**3. Get the pinned SDK version.** This project pins **SDK 2.10.4** in
-[daml.yaml](daml.yaml). The first `daml build`/`daml start` inside the
-project auto-installs that version; to pull it ahead of time:
-
-```sh
-daml install 2.10.4
-daml version        # 2.10.4 should be listed
 ```
 
 ## Running it
@@ -264,13 +262,13 @@ number, with the contract deriving who owes whom. `history` now holds two
 > **Fat-finger / default guards:** a `markToMarket` of `0`, or one whose
 > magnitude exceeds the 10,000,000 notional, is rejected outright. A move
 > larger than the payer's balance instead archives the trade into
-> **`SettlementFailed`** (no successor trade) — try `markToMarket = 9000000`
+> **`SettlementFailure`** (no successor trade) — try `markToMarket = 9000000`
 > on a fresh run to see the default path.
 
 ### 3. Periodic settlement (the coupon / net payment)
 
 Now the quarterly reset. In the **oracle** window, on the current
-`IRSTrade`, exercise **`SettlePeriod`**:
+`IRSTrade`, exercise **`SettleCashflow`**:
 
 - `periodEnd`     = `2026-10-20`  (a quarter after the effective date)
 - `observedRate`  = `0.03`  (the SOFR fixing — a **decimal fraction**,
@@ -286,7 +284,7 @@ dayFraction = dayCountFraction fixedLeg.dayCount lastSettledDate periodEnd
 ```
 
 `lastSettledDate` is a field the trade tracks **itself** — `effectiveDate`
-until the first `SettlePeriod`, then that call's `periodEnd` — so the
+until the first `SettleCashflow`, then that call's `periodEnd` — so the
 elapsed period is derived from the contract's own state, not from a second
 date the oracle would otherwise have to submit (and could get wrong). The
 seeded trade's fixed leg uses `Thirty360` (30/360: every month counted as
@@ -303,13 +301,13 @@ seeded trade's fixed leg uses `Thirty360` (30/360: every month counted as
 | Bob-USD   | 980,000 | **1,005,000** |
 
 The recreated trade advances `lastSettledDate` to `2026-10-20` and appends
-a `PeriodEvent` (wrapping a `PeriodRecord`: rate, net payment, who paid
+a `CashflowEvent` (wrapping a `CashflowRecord`: rate, net payment, who paid
 whom) to `history` — the same list the two margin calls above appended
 `MarginEvent`s to, now three entries long, in order. Inspect it in any
 window. Above the 4% fixed rate the flow reverses: try `observedRate =
 0.05` and Bob pays Alice 25,000 instead.
 
-> **Try a second period:** exercising `SettlePeriod` again with `periodEnd
+> **Try a second period:** exercising `SettleCashflow` again with `periodEnd
 > = 2026-10-20` (the same date) **fails** — `lastSettledDate` is now
 > `2026-10-20`, and the contract requires `periodEnd` to be strictly after
 > it, so a stale or repeated fixing can't silently corrupt the schedule.
@@ -329,15 +327,15 @@ window. Above the 4% fixed rate the flow reverses: try `observedRate =
 > exactly `90/360 = 0.25`.) Try switching the seeded trade's
 > `fixedLeg.dayCount` to `Act360` in `Setup.daml` to see this in action.
 
-### 4. Novation (propose → accept, entirely in Navigator)
+### 4. Novation (propose → accept → confirm, tri-party)
 
-Moving a party in or out of the trade needs two parties' consent, but as
-**propose-accept** rather than one dual-controller choice — so, unlike the
-old `Novate`, it's fully drivable from Navigator, no `daml repl` needed.
-See [ARCHITECTURE.md](ARCHITECTURE.md), "Propose-accept: carrying authority
-across transactions", for why this split was necessary in the first place
-(and why it's the only thing that works once Bob and Charlie are on
-genuinely separate participant nodes).
+Moving a party in or out of the trade needs **three** consents, real ISDA
+novation-style — the outgoing party, the incoming party, and the
+*remaining* party, whose counterparty credit risk changes as a result and
+who gets the final say. Each is still a single-party step via
+**propose-accept**, chained twice. See
+[ARCHITECTURE.md](ARCHITECTURE.md), "Propose-accept: carrying authority
+across transactions".
 
 Open a **fourth** Chrome profile for **Charlie** — `Setup.daml` already
 funded his **Charlie-USD** account (1,000,000 USD), unattached to any
@@ -370,19 +368,29 @@ exercise **`AcceptNovation`**:
 - `transfereeCashCid` = Charlie's **Charlie-USD** `CashHolding` contract ID
   (open that contract in his window to copy it)
 
-A new `IRSTrade` appears with **Charlie in Bob's slot** — check **Alice's**
-window: her counterparty is now Charlie, and her balance/history are
-unchanged (novation transfers the *position*, not a cash payment).
-Charlie-USD still reads 1,000,000.
+This does **not** create the novated trade yet — check **Alice's** window:
+there is no live `IRSTrade` anywhere right now, for anyone. It creates a
+`NovationConfirmation` instead, appearing in **Alice's** window (she's a
+signatory of it — the remaining party's decision is what's still pending).
 
-> **Decline instead:** exercising **`RejectNovation`** on the proposal
-> (also a Charlie-only choice) recreates the ORIGINAL trade — Alice and Bob,
-> unchanged — rather than stranding it. Try this on a fresh run: the trade
-> survives a declined novation and keeps settling normally afterward.
+**Confirm** — in **Alice's** window, open the `NovationConfirmation` and
+exercise **`ConfirmNovation`** (no arguments). *Now* a new `IRSTrade`
+appears with **Charlie in Bob's slot** — Alice's counterparty is Charlie,
+and her balance/history are unchanged (novation transfers the *position*,
+not a cash payment). Charlie-USD still reads 1,000,000.
 
-### 5. Termination (propose → accept, entirely in Navigator)
+> **Decline instead, two different points:** exercising **`RejectNovation`**
+> on the `NovationProposal` (a Charlie-only choice) has him decline outright
+> before Alice is ever involved. Exercising **`DeclineNovation`** on the
+> `NovationConfirmation` (an Alice-only choice) is her veto **after**
+> Charlie has already accepted — she still gets the final word, because
+> novating changes whose credit risk she's carrying. Either path recreates
+> the ORIGINAL trade — Alice and Bob, unchanged — rather than stranding it,
+> and it keeps settling normally afterward. Try both on a fresh run.
 
-Ending the trade early needs both current counterparties' consent too, and
+### 5. Termination (propose → accept)
+
+Ending the trade early needs both current counterparties' consent, and
 it's propose-accept for the same reason novation is: `ProposeTermination`
 (controller = proposer alone) / `AcceptTermination` or `RejectTermination`
 (controller = the other party alone). See
@@ -421,7 +429,7 @@ from every window with no successor — the trade is over.
 
 ## What's intentionally simplified / left as TODO
 
-- `SettlePeriod`'s day-count fraction is now real date arithmetic
+- `SettleCashflow`'s day-count fraction is now real date arithmetic
   (`Types.daml`'s `dayCountFraction`: `Act360`/`Act365`/`Thirty360`), but
   with **no holiday calendars or business-day adjustment** — period
   boundaries are used exactly as submitted rather than rolled to the
@@ -435,15 +443,10 @@ from every window with no successor — the trade is over.
 - No grace period: a payer who can't cover a settlement/margin move fails
   immediately. Real CSAs allow a cure period (typically T+1) before
   failure-to-pay escalates to a formal ISDA Master Agreement Event of
-  Default — what's modeled here (`SettlementFailed`) is closer to a single
+  Default — what's modeled here (`SettlementFailure`) is closer to a single
   settlement fail than that broader, more consequential concept.
-- `SettlementFailed` records the facts but doesn't route into any
+- `SettlementFailure` records the facts but doesn't route into any
   default-management / close-out-auction logic.
-- Novation here is **bilateral** (transferor + transferee consent only).
-  Real ISDA novations are typically **tri-party** — they also require the
-  *remaining* party's consent, since novating changes who they face for
-  counterparty credit risk. This codebase currently assumes that consent
-  is implicit in having agreed to the trade documentation up front.
 - Mark-to-market and rate fixings are trusted oracle inputs; there's no
   on-ledger cross-check of the number itself (a real deployment would use
   a signed/attested feed).

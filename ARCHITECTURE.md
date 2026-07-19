@@ -85,21 +85,28 @@ a later choice is exercised on that contract, the transaction's available
 authority = (the contract's **signatories**) ∪ (the choice's controllers)
 — so a party who is merely a *signatory* of the carrier contract
 contributes its authority to whatever that contract's controller-only
-choices do next, with no further submission from that party required. Two
-instances of this pattern in this codebase:
+choices do next, with no further submission from that party required.
+Nothing restricts this to two hops, either — chain it again and a third
+party's consent joins the same way. Three instances of this pattern in
+this codebase:
 
-- **Trade execution** — `IRSProposal` (signatory = `proposer` alone) /
-  `AcceptIRS` (controller = `counterparty`). Accepting creates `IRSTrade`
+- **Trade execution** — `TradeProposal` (signatory = `proposer` alone) /
+  `AcceptTrade` (controller = `counterparty`). Accepting creates `IRSTrade`
   signed by `{proposer, counterparty}`; available authority at that point =
   `{proposer}` (from the proposal's signatory) ∪ `{counterparty}` (the
   accept choice's controller) = exactly the two signatories needed. Neither
   party ever needed to `actAs` the other.
 
-- **Novation** — `ProposeNovation` (a *consuming* choice on the live
-  `IRSTrade`, `controller transferor`) / `AcceptNovation` or
-  `RejectNovation` (both `controller transferee`) on the
-  `NovationProposal` it creates — `transferor`/`transferee` are ISDA's own
-  Novation Agreement terms for the two roles. Two details make this one
+- **Novation — tri-party, chained twice.** Real ISDA novations need three
+  consents, not two: the **transferor** (stepping out), the **transferee**
+  (stepping in), and the **remaining party** — whose counterparty credit
+  risk changes as a result, so they get a genuine say, not just inherited
+  authority. That's `ProposeNovation` (a *consuming* choice on the live
+  `IRSTrade`, `controller transferor`) → `NovationProposal` →
+  `AcceptNovation` or `RejectNovation` (`controller transferee`) →
+  `NovationConfirmation` → `ConfirmNovation` or `DeclineNovation`
+  (`controller remainingParty`). `transferor`/`transferee` are ISDA's own
+  Novation Agreement terms for the two roles. Three details make this one
   work correctly:
 
   1. **Archiving the old trade needs no new authority.** Because
@@ -107,35 +114,45 @@ instances of this pattern in this codebase:
      already `{fixedRatePayer, floatingRatePayer}`, the archive is
      authorized regardless of which single party is the choice's controller
      (see "Authority vs. visibility" above) — `transferor` alone is
-     enough to trigger it.
-  2. **`NovationProposal` must carry BOTH original signatories forward, not
-     just the remaining party.** `AcceptNovation` only needs the remaining
-     party's authority (to create the new trade signed by
-     `{remainingParty, transferee}`), but `RejectNovation` needs to
-     recreate the *original* trade signed by `{fixedRatePayer,
-     floatingRatePayer}` — including the transferor, who by then has
-     already left and submitted nothing further. Making
-     `NovationProposal`'s signatories `fixedRatePayer, floatingRatePayer`
-     (both — available for free per point 1) rather than just the
-     remaining party is what makes the reject path work without stranding
-     the trade if the transferee declines.
+     enough to trigger it. This also fixes `remainingParty` for the whole
+     flow: it's computed once here (whichever of `fixedRatePayer`/
+     `floatingRatePayer` isn't `transferor`) and stored on `NovationProposal`,
+     the same way `TerminationProposal.otherParty` is.
+  2. **`AcceptNovation` can't create the final trade directly** — that would
+     silently skip the remaining party's consent, the exact gap a tri-party
+     flow exists to close. Instead it creates `NovationConfirmation`,
+     signed by all **three** parties at once: `{fixedRatePayer,
+     floatingRatePayer}` (= `{transferor, remainingParty}`, carried forward
+     from `NovationProposal`'s signatories) plus `transferee`, `AcceptNovation`'s
+     own controller. That three-way signature is available for free the
+     moment `AcceptNovation` runs — the same trick as step 1, one hop later.
+  3. **Both proposal-stage AND confirmation-stage rejection recreate the
+     ORIGINAL trade, not just archive things.** `NovationProposal`'s
+     signatories carry `transferor`'s authority forward for `RejectNovation`
+     (transferee declines outright); `NovationConfirmation`'s signatories
+     carry it forward *again* for `DeclineNovation` (remaining party vetoes
+     even after the transferee already accepted) — in both cases recreating
+     `IRSTrade` signed by `{transferor, remainingParty}` without transferor
+     ever submitting a second (or third) time. `ConfirmNovation` needs only
+     `remainingParty`'s own authority plus `transferee`'s, carried forward
+     from `NovationConfirmation`'s signatories, to create the novated trade
+     signed by `{remainingParty, transferee}`.
 
-  The result: `Novate`'s old single dual-controller choice becomes three
-  single-controller choices across two transactions, each submittable by
-  exactly one party from its own participant — no co-hosting required.
-  (Note: this is still bilateral consent, transferor + transferee only —
-  see "What's intentionally simplified" in `README.md` for the tri-party
-  gap versus real ISDA novation.)
+  The result: `Novate`'s old single dual-controller choice becomes five
+  single-controller choices across three transactions, each submittable by
+  exactly one party from its own participant — no co-hosting required,
+  genuinely three-way consent, not two-way-plus-inherited-authority.
 
-- **Termination** — identical shape to novation, one level simpler:
+- **Termination** — identical shape to the novation *proposal* stage, one
+  level simpler (no third party to chase):
   `ProposeTermination` (`controller proposer`, consuming on `IRSTrade`) /
   `AcceptTermination` or `RejectTermination` (both `controller
   otherParty`) on the `TerminationProposal` it creates. `otherParty` is
   computed once at proposal time (whichever of `fixedRatePayer` /
   `floatingRatePayer` isn't `proposer`) and stored, same role
-  `transferee` plays for novation — except termination has no third
-  party, so `AcceptTermination` has nothing left to do but archive the
-  proposal (`pure ()`, no successor), while `RejectTermination` recreates
+  `transferee` plays for novation's first hop — `AcceptTermination` has
+  nothing left to do but archive the proposal (`pure ()`, no successor),
+  while `RejectTermination` recreates
   the original trade exactly like `RejectNovation` does, for the same
   reason: `TerminationProposal` carries both original signatories forward,
   so the proposer never needs to submit again either way.
@@ -153,7 +170,7 @@ project targets SDK 2.10.4, where propose-accept is the available pattern.
 
 ## Oracle / calculation-agent pattern
 
-`SettlePeriod` and `SettleMargin` are controlled *solely* by an oracle
+`SettleCashflow` and `SettleMargin` are controlled *solely* by an oracle
 party that submits only an objective external number (a rate fixing, a
 mark-to-market) and never a party or contract ID — so it stays oblivious to
 counterparty identities. The contract itself derives who owes whom and by
@@ -176,16 +193,18 @@ holder a creditor of a private issuer — a materially weaker claim, worth
 being deliberate about which one this project's `CashHolding` is meant to
 stand in for.
 
-This project implements that atomic DvP: `SettlePeriod` / `SettleMargin`
+This project implements that atomic DvP: `SettleCashflow` / `SettleMargin`
 compute the amount, then debit the payer's `CashHolding` and credit the
 receiver's (via `AdjustBalance`) and recreate the trade — all in one
 transaction. If the payer's account can't cover the amount, the same
-transaction instead archives the trade into a terminal `SettlementFailed`
+transaction instead archives the trade into a terminal `SettlementFailure`
 (no successor `IRSTrade`, so the ledger structurally prevents any further
 lifecycle action). Each party keeps a single account; the trade stores
 both accounts' contract IDs and refreshes them on every settle.
 
-## Core model: no global ledger
+## Core concepts: 
+
+### No global ledger
 
 There is no single shared database. State is the **Active Contract Set
 (ACS)** — the set of live (created, not-archived) contract instances — but
@@ -194,7 +213,7 @@ only contracts where its own hosted parties are signatories, observers, or
 controllers. Every state change is archive-old + create-new; DAML has no
 in-place mutation.
 
-## Transaction flow (what happens when a choice is exercised)
+### Transaction flow (what happens when a choice is exercised)
 
 1. Submitting participant builds the transaction as a **tree** of action
    nodes (Create/Exercise/Fetch), decomposes it into **views** along
@@ -223,7 +242,7 @@ malicious mediator can't forge a valid commit, because verdicts are built
 from cryptographically signed, independently-checkable confirmations. The
 mediator role itself can run as a small BFT cluster rather than one node.
 
-## Sync domains / Global Synchronizer
+### Sync domains / Global Synchronizer
 
 A **sync domain** = sequencer + mediator (+ topology manager), the
 coordination layer participants connect to. Domains can be private
@@ -234,7 +253,7 @@ domain. Community edition Canton bundles sequencer+mediator+topology
 manager into one **embedded domain** node; separating them is an
 Enterprise feature.
 
-## Identity & cryptography
+### Identity & cryptography
 
 - **Client app → own participant**: JWT bearer tokens (OAuth2/OIDC),
   `actAs`/`readAs` claims scoped to parties. The participant validates,
@@ -257,7 +276,7 @@ Enterprise feature.
   signed topology mapping the sequencer looks up — not a decision it makes
   itself.
 
-## Client-side interaction
+### Client-side interaction
 
 - **Ledger API**: gRPC or JSON-over-HTTP. Two core commands:
   `CreateCommand`, `ExerciseCommand`. `daml codegen` generates typed
@@ -286,7 +305,7 @@ Enterprise feature.
   (indexed DB) — for inspecting already-committed data, not for
   submitting new commands.
 
-## Deployment
+### Deployment
 
 1. `daml build` → `.dar` file (DAML-LF bytecode).
 2. Upload the DAR to every participant that needs it (`participant.dars.upload`

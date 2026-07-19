@@ -77,7 +77,7 @@ data FloatingLeg = FloatingLeg
   deriving (Eq, Show)
 
 -- A single settled/observed period -- mirrors a CDM "ResetEvent" / "PaymentEvent"
-data PeriodRecord = PeriodRecord
+data CashflowRecord = CashflowRecord
   with
     periodEnd    : Date
     observedRate : Decimal
@@ -102,6 +102,6 @@ data MarginRecord = MarginRecord
 -- the order events actually happened rather than needing to be merged and
 -- re-sorted by the reader.
 data LifecycleEvent
-  = PeriodEvent PeriodRecord
+  = CashflowEvent CashflowRecord
   | MarginEvent MarginRecord
   deriving (Eq, Show)
