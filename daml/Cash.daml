@@ -24,10 +24,12 @@ template CashHolding
                            -- account is identifiable at a glance in Navigator
     currency  : Currency
     amount    : Decimal
-    observers : [Party]    -- the trade's oracle/settlement agent: it can see
-                           -- this account AND must co-authorize any balance
-                           -- change (see AdjustBalance) -- so cash only ever
-                           -- moves inside a settlement, never by the owner alone
+    observers : [Party]    -- the trade's oracle/settlement agent: it can
+                           -- SEE this account, so it can name it in a
+                           -- Transfer/settlement it submits -- but it is
+                           -- NOT required to co-authorize one any more (see
+                           -- Transfer below). Visibility and authorization
+                           -- are separate concerns here on purpose.
   where
     signatory issuer
     observer owner, observers
@@ -37,7 +39,7 @@ template CashHolding
     -- One account per (issuer, owner, currency) -- e.g. "Alice's USD
     -- account at the Bank" -- rather than per contract instance. This is
     -- what lets many independent trades reference "the same account"
-    -- safely: DAML's archive-and-recreate means every AdjustBalance
+    -- safely: DAML's archive-and-recreate means every balance change
     -- swaps in a brand new contract id, so anything that stored the OLD
     -- id directly would go stale the instant any other trade settled
     -- first. A key sidesteps that entirely -- see tryMoveCash below,
@@ -48,35 +50,63 @@ template CashHolding
     key CashAccountKey with issuer; owner; currency : CashAccountKey
     maintainer key.issuer
 
-    -- Debits or credits the balance in place (archive-and-recreate, since
-    -- DAML has no true mutation). This is the primitive every product's
-    -- atomic DvP is built on.
-    --
-    -- Controlled by owner + observers (the settlement agent / oracle), NOT
-    -- the owner alone. So a counterparty CANNOT move -- or mint into -- its
-    -- own account unilaterally: a direct submit as just the owner (e.g. from
-    -- Navigator) fails authorization because the oracle's authority is
-    -- missing. The balance only ever changes inside a trade's settlement
-    -- choice, where the trade already carries the owner's signatory
-    -- authority AND the oracle is the controller of that choice -- so both
-    -- required authorities are present together, and nowhere else.
-    --
-    -- (`observers` is [oracle] on every account created here; requiring the
-    -- whole observer set to co-authorize keeps this one-controller-line fix
-    -- self-contained. If a non-settlement observer is ever added, give the
-    -- account a dedicated settlement-agent field instead.)
-    --
-    -- `delta` positive = credit (receiver), negative = debit (payer). The
-    -- `ensure amount >= 0.0` above (re-checked here) is what makes an
-    -- overdrawn debit fail -- the caller checks the balance first and
-    -- routes to default instead of letting this abort the transaction.
-    choice AdjustBalance : ContractId CashHolding
+    -- Mints new balance -- controlled by **issuer alone**, never the
+    -- owner. This models the custodian recording a genuine incoming
+    -- transfer (a real wire hitting the account); the owner can't
+    -- fabricate balance out of thin air just by asking. Contrast
+    -- `Transfer` below, which moves EXISTING balance and needs no
+    -- issuer involvement beyond its standing signature.
+    choice CreditAccount : ContractId CashHolding
       with
         delta : Decimal
-      controller owner :: observers
+      controller issuer
       do
-        assertMsg "Insufficient balance" (amount + delta >= 0.0)
+        assertMsg "Credit amount must be positive" (delta > 0.0)
         create this with amount = amount + delta
+
+    -- Debits THIS account and credits `destination` atomically -- a
+    -- genuine, value-conserving transfer between two real accounts, not a
+    -- mint: whatever leaves here is exactly what appears at destination,
+    -- in the same transaction. Controlled by **owner alone**: moving your
+    -- own money needs no one else's consent, the same as a real bank
+    -- transfer -- and the recipient doesn't need to separately agree to
+    -- be paid, also same as a real transfer. No oracle/observer
+    -- involvement needed for a party-initiated transfer.
+    --
+    -- This is also what `tryMoveCash` below calls for every settlement:
+    -- exercised there as a NESTED action inside a trade choice, so
+    -- `owner` (whichever counterparty is paying) doesn't need to submit
+    -- separately -- their consent is already present as a signatory of
+    -- the trade (see ARCHITECTURE.md, "Propose-accept: carrying authority
+    -- across transactions"). The nested `CreditAccount` on the
+    -- destination account likewise needs no extra plumbing: `issuer` is
+    -- already implicated as THIS account's own signatory the moment
+    -- `Transfer` is exercised, and (assuming a shared custodian, true for
+    -- every account in this project) that's the same party who signs the
+    -- destination account too -- see ARCHITECTURE.md, "Authority vs.
+    -- visibility", for exactly how that propagates.
+    --
+    -- Two real constraints worth naming, not glossing over: (1) `owner`
+    -- submitting directly (e.g. from Navigator) must already be able to
+    -- SEE `destination` -- a stakeholder of it, or the submission needs
+    -- `readAs` -- the same visibility rule as any fetchByKey (see
+    -- ARCHITECTURE.md); sending to an arbitrary party's account you have
+    -- no visibility into needs a readAs-capable client, not Navigator.
+    -- (2) cross-issuer transfers don't work (the destination's issuer
+    -- would need to separately authorize, and nothing here asks it to) --
+    -- fine within this project (one shared Bank), but a real
+    -- multi-custodian transfer needs actual interbank settlement rails.
+    choice Transfer : ContractId CashHolding
+      with
+        transferAmount : Decimal
+        destination    : CashAccountKey
+      controller owner
+      do
+        assertMsg "Transfer amount must be positive" (transferAmount > 0.0)
+        assertMsg "Insufficient balance" (amount >= transferAmount)
+        assertMsg "Currency mismatch" (destination.currency == currency)
+        _ <- exerciseByKey @CashHolding destination CreditAccount with delta = transferAmount
+        create this with amount = amount - transferAmount
 
 data CashAccountKey = CashAccountKey
   with
@@ -102,11 +132,12 @@ data CashAccountKey = CashAccountKey
 --     rather than aborting the transaction.
 --
 -- Authorization: this runs inside a trade choice, so the transaction
--- already carries both parties' signatory authority; the AdjustBalance
--- controller (the account owner, = payer or receiver) is therefore
--- authorized without either party submitting. Visibility: the submitter
--- (the oracle) must readAs both parties so both accounts are fetchable --
--- see Setup / the JSON API oracle token.
+-- already carries both parties' signatory authority; `Transfer`'s
+-- controller (the payer, as account owner) is therefore authorized
+-- without the payer submitting anything themselves -- see `Transfer`'s
+-- own comment above for the full chain. Visibility: the submitter (the
+-- oracle) must be able to see both accounts to name them here -- see
+-- CashHolding's `observers`.
 tryMoveCash
   :  Party                -- payer
   -> Decimal               -- amount (must be > 0)
@@ -121,7 +152,6 @@ tryMoveCash payer amount partyA partyB issuer currency = do
   (_, payerHolding) <- fetchByKey @CashHolding payerKey
   if payerHolding.amount >= amount
     then do
-      _ <- exerciseByKey @CashHolding payerKey AdjustBalance with delta = negate amount
-      _ <- exerciseByKey @CashHolding receiverKey AdjustBalance with delta = amount
+      _ <- exerciseByKey @CashHolding payerKey Transfer with transferAmount = amount; destination = receiverKey
       pure None
     else pure (Some payerHolding.amount)

@@ -126,9 +126,13 @@ they're easy to conflate:
   by *both* `fixedRatePayer` and `floatingRatePayer`, any choice on it —
   even one controlled by a third party like the oracle, or one inherited
   from `INovatable` — already carries both counterparties' authority.
-  That's why the oracle can move *their* cash: exercising `AdjustBalance`
-  (controller = the account owner) is authorized without either party
-  submitting anything.
+  That's why the oracle can move *their* cash: `tryMoveCash`'s
+  `Transfer` call (`controller owner`, i.e. the paying counterparty) is
+  authorized without that counterparty submitting anything, because
+  they're already a signatory of the trade the oracle is exercising a
+  choice on. **The oracle itself is not a controller of anything on
+  `CashHolding`** — see "Mint vs. transfer" below for why that's a
+  deliberate design choice, not an oversight.
 - **Visibility** = who can *see* a contract to act on it. Independent of
   authority. The submitting/reading parties must be stakeholders
   (signatory or observer) of any contract the transaction fetches or
@@ -144,7 +148,76 @@ oracle is an observer on every cash account — because it's explicit in the
 data model and works from Navigator (which submits with `actAs` = only the
 logged-in party, no `readAs`). The trade-off: the oracle can then see
 every counterparty's balance, which for a settlement/calc agent is
-realistic.
+realistic. Note this is now **purely** a visibility grant — see "Mint vs.
+transfer" below for why the oracle needs no authorization role on
+`CashHolding` at all, only this one.
+
+### Mint vs. transfer: two different authorization needs, two different choices
+
+`CashHolding` splits what used to be one loosely-authorized `AdjustBalance`
+choice into two, because "change the balance" is actually two very
+different real-world actions with different trust requirements:
+
+- **`CreditAccount`** (`controller issuer` alone) — mints new balance.
+  Models the custodian recording a genuine incoming transfer; an owner
+  can't fabricate balance just by asking, so the owner is deliberately
+  **not** a controller here at all.
+- **`Transfer`** (`controller owner` alone) — debits this account and
+  credits a `destination` account (by key) atomically, so nothing is
+  fabricated: whatever leaves one account is exactly what appears in the
+  other, in the same transaction. Moving money you already own needs no
+  one else's consent, the same as a real bank transfer, so the owner
+  needs no co-signer here either — not the issuer, and (contrast the
+  earlier, since-corrected design) **not the oracle**.
+
+The interesting part is that `tryMoveCash` (the derivatives-settlement
+DvP primitive) is now just **one `Transfer` call**, exercised as a nested
+action inside a trade's settlement choice — and it works with *zero*
+special-casing for that context, which is worth tracing through
+precisely, because it's a clean illustration of how Daml authorization
+actually composes across nested exercises on *different* contracts (not
+just the same contract, which "Propose-accept" below already covers):
+
+1. `SettleMargin` is exercised on `IRSTrade` (signatories =
+   `{fixedRatePayer, floatingRatePayer}`), controller = `oracle`. This
+   requires `oracle` to be traceable to the submitter (`actAs`) — trivially
+   true, oracle submitted it. The signatories of `IRSTrade` don't need to
+   be separately traced to anyone — being *signatories of the very
+   contract being exercised* is exactly what "authorized" means for them;
+   they pre-committed to this at the trade's creation. Both facts combine
+   into what's available to `SettleMargin`'s own body: `{oracle,
+   fixedRatePayer, floatingRatePayer}`.
+2. Inside that body, `tryMoveCash` exercises `Transfer` on the payer's
+   `CashHolding` (signatories = `{issuer}`), controller = `owner` (=
+   payer). Required: `owner` traceable to what's available so far — yes,
+   payer is one of `{fixedRatePayer, floatingRatePayer}` from step 1.
+   `issuer` doesn't need tracing either, same reasoning as step 1 (it's
+   that specific `CashHolding`'s own signatory). What's now available to
+   `Transfer`'s own body: the step-1 set **plus** `issuer` and `owner`
+   (the newly-exercised contract's signatories and this choice's
+   controllers) — i.e. `{oracle, fixedRatePayer, floatingRatePayer,
+   issuer}`.
+3. `Transfer`'s body exercises `CreditAccount` on the *receiver's*
+   `CashHolding` — a **different contract**, but signed by the same
+   `issuer` party (every account in this project shares one Bank).
+   Required controller: `issuer` — already available, from step 2. No
+   extra authorization needed, and critically, **the oracle was never a
+   controller of either cash choice** — its only role in this whole
+   chain was being the submitter (hence needing visibility, per
+   "Authority vs. visibility" above) and the controller of the *outer*
+   `SettleMargin` choice.
+
+The general shape: a contract's signatories are always self-satisfied for
+choices on *that* contract, and then join the pool of parties available
+to authorize whatever that choice's body does next — so authority
+"widens" one exercise at a time as the transaction descends, rather than
+needing to be pre-declared all at once at the root. This is also exactly
+why `Transfer` breaks across **different issuers**: if the destination
+account were signed by a different Bank party, that party would never
+have entered the pool at any step, and `CreditAccount`'s `controller
+issuer` requirement would fail — correctly, since moving money between
+two actually-different custodians needs real interbank cooperation, not
+just the sender's say-so.
 
 **The same rule applies to `fetchByKey`/`exerciseByKey`, not just
 `fetch`/`exercise` by contract id** — a lesson this codebase hit
@@ -384,9 +457,9 @@ sequenceDiagram
     Note over Trade: signatories = both counterparties (authority already present)
     Oracle->>Trade: exercise Settle... (controller = oracle)
     Note over Oracle,Trade: available authority = signatories(Trade) ∪ {oracle}
-    Trade->>PayerCash: exercise AdjustBalance (delta = −amount)
-    Note over PayerCash: controller = owner :: observers -- owner's authority comes from Trade's signatories, oracle's from being an observer+controller
-    Trade->>ReceiverCash: exercise AdjustBalance (delta = +amount)
+    Trade->>PayerCash: exercise Transfer (controller = owner = payer, already available)
+    Note over PayerCash: oracle is NOT a controller here -- only needs VISIBILITY (observer) to submit this at all
+    PayerCash->>ReceiverCash: exercise CreditAccount (controller = issuer, shared by both accounts)
     Trade-->>Oracle: new trade (or SettlementFailure if payer can't cover it)
 ```
 
@@ -404,11 +477,14 @@ stand in for.
 Both products implement that atomic DvP the same way, via **`Cash.daml`'s
 shared `tryMoveCash` helper**: given a payer, an amount, both parties'
 identities, and the trade's agreed `cashIssuer`/`settlementCurrency`, it
-resolves each party's **current** `CashHolding` by key
+resolves the payer's **current** `CashHolding` by key
 (`fetchByKey`/`exerciseByKey` against `CashAccountKey = issuer + owner +
-currency`) and debits/credits it via `AdjustBalance`, returning `None` on
-success or the payer's actual available balance (`Some available`) on
-failure. Each product's settlement choice (`SettleCashflow`/`SettleMargin`
+currency`) and exercises a single `Transfer` to the receiver's account
+(also resolved by key), returning `None` on success or the payer's actual
+available balance (`Some available`) on failure — see "Mint vs. transfer"
+above for exactly how that one nested `Transfer`/`CreditAccount` pair
+gets authorized without the oracle being a controller of either. Each
+product's settlement choice (`SettleCashflow`/`SettleMargin`
 for IRS, `SettlePremium`/`SettleMargin`/`SettleCreditEvent` for CDS)
 computes its own product-specific amount and direction, then hands off to
 `tryMoveCash` and recreates the trade (or, on `Some`, builds its own

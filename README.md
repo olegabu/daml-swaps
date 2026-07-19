@@ -61,17 +61,21 @@ two copies of the same logic — see "Modules" below and
   **contract key** (`CashAccountKey` = issuer + owner + currency, not a
   contract id — see "What `CashHolding` maps to" below), plus the shared
   **`tryMoveCash`** DvP helper both products' settlement choices call
-  into, which resolves both parties' CURRENT accounts by key. Its
-  `AdjustBalance` choice debits/credits the balance in place; controlled
-  by **owner + oracle together**, so a counterparty can't move (or mint
-  into) its own account unilaterally — the balance only ever changes
-  inside a settlement, where both authorities co-occur.
+  into, which resolves both parties' CURRENT accounts by key. Two
+  choices, split by what each actually needs to be true: `CreditAccount`
+  (`controller issuer` alone) mints new balance — models the custodian
+  recording a genuine incoming transfer, so an owner can't fabricate
+  balance just by asking; `Transfer` (`controller owner` alone) debits
+  this account and credits a destination account by key, atomically — a
+  real, value-conserving move a party can make unilaterally, no oracle
+  needed, the same as a real bank transfer. `tryMoveCash` is just one
+  `Transfer` call (payer → receiver) exercised as a nested action inside
+  a settlement choice.
 - **`Lifecycle.daml`** — Daml **interfaces** hosting the novation and
   termination lifecycle, written once and shared by both `IRSTrade` and
   `CDSTrade`: `INovatable`/`INovationProposal`/`INovationConfirmation` and
   `ITerminable`/`ITerminationProposal`. Modeled directly on the Daml SDK's
-  own `daml-intro-13` tutorial (`IAsset`/`Cash`/`NFT`, bundled with this
-  project's pinned SDK 2.10.4) — see
+  own `daml-intro-13` tutorial (`IAsset`/`Cash`/`NFT`) — see
   [ARCHITECTURE.md](ARCHITECTURE.md), "Shared lifecycle via interfaces",
   for the full design and why it's safe.
 - **`IRS.daml`** — the IRS-specific contract:
@@ -139,7 +143,7 @@ two copies of the same logic — see "Modules" below and
   both seeded trades, and any number more); and strikes **both** a live
   `IRSTrade` and a live `CDSTrade` between Alice and Bob via the real
   propose-accept flow, both settling through the same Bank/USD.
-- **`IRSTest.daml`** — IRS's Daml Script tests (29 tests): direct,
+- **`IRSTest.daml`** — IRS's Daml Script tests (31 tests): direct,
   ledger-free unit tests of `dayCountFraction`, plus full lifecycle tests
   covering every explicit choice at least once. Unchanged by the
   interface retrofit — it never inspected `NovationProposal`/
@@ -160,12 +164,12 @@ concepts this code assumes.
 An earlier version of this codebase stored a specific `ContractId
 CashHolding` on every trade, refreshing it on each settle. That breaks
 the moment two trades share an account: DAML's archive-and-recreate means
-`AdjustBalance` swaps in a brand-new contract id every time it runs, so
-whichever trade settles first silently strands every OTHER trade's stored
-id, and their next settlement fails `CONTRACT_NOT_FOUND`. The stopgap was
-giving every trade its **own segregated account** — workable for the two
-trades this demo seeds, but obviously wrong in general: a real trader can
-have hundreds of live positions, and nobody opens a hundred settlement
+every balance change swaps in a brand-new contract id, so whichever trade
+settles first silently strands every OTHER trade's stored id, and their
+next settlement fails `CONTRACT_NOT_FOUND`. The stopgap was giving every
+trade its **own segregated account** — workable for the two trades this
+demo seeds, but obviously wrong in general: a real trader can have
+hundreds of live positions, and nobody opens a hundred settlement
 accounts to hold them.
 
 The actual fix is a Daml **contract key** (`Cash.daml`'s
@@ -214,6 +218,47 @@ hook for a credit event payout that can run up to the full notional, on
 top of his IRS margin/settlement flows through that same account —
 real protection sellers are capitalized against exactly this tail risk.
 
+### `tryMoveCash`: how the oracle moves money it doesn't own
+
+`CashHolding` has two choices, split by what each one actually needs to
+be true, not lumped into one loosely-guarded "adjust the balance" choice:
+
+- **`CreditAccount`** (`controller issuer` alone) — mints new balance.
+  Models the custodian recording a real incoming transfer; the owner
+  can't fabricate balance just by asking, so the owner isn't a controller
+  here at all.
+- **`Transfer`** (`controller owner` alone) — debits this account and
+  credits a `destination` account (found by key) atomically, so nothing
+  is fabricated: whatever leaves one account is exactly what appears in
+  the other. Moving money you already own needs no one else's consent,
+  same as a real bank transfer — not the issuer, and (deliberately) not
+  the oracle either.
+
+`tryMoveCash` — the helper every settlement choice in both products calls
+— is just **one `Transfer` call**, payer's account to receiver's,
+resolved by key. The interesting part: this works from inside a
+derivatives settlement with **zero special-casing for the oracle** — the
+oracle submits `SettleMargin`/`SettlePremium`/etc., but it is never a
+*controller* of anything on `CashHolding`, only a declared *observer* (so
+it can see the accounts to name them — see "What `CashHolding` maps to"
+above). Authority for the actual money movement comes entirely from the
+paying counterparty already being a signatory of the trade the oracle is
+exercising a choice on — the same "authority carried forward" trick
+`ProposeNovation`/`ProposeTermination` use (see
+[ARCHITECTURE.md](ARCHITECTURE.md), "Propose-accept: carrying authority
+across transactions") — plus one more step: the `issuer` party, being the
+signatory of *both* the payer's and receiver's accounts (every account in
+this project shares one Bank), becomes available to authorize the
+destination-side `CreditAccount` the moment `Transfer` touches the
+payer's account, with no separate consent needed. See
+[ARCHITECTURE.md](ARCHITECTURE.md), "Mint vs. transfer," for that
+authorization chain traced precisely, step by step.
+
+One consequence worth knowing: a party CAN unilaterally `Transfer` their
+own real money to any account they can see — no settlement, no oracle
+involved (see the demo's "Try to cheat first" callout below for exactly
+what that does and doesn't let you do from Navigator).
+
 ## Getting started
 
 The only hard dependency is the **Daml SDK**; it bundles everything else
@@ -254,7 +299,7 @@ From the project root:
 
 ```sh
 daml build              # compile the eight modules to a DAR
-daml test               # run both products' Daml Script lifecycle tests (45 total)
+daml test               # run both products' Daml Script lifecycle tests (48 total)
 daml start              # sandbox + JSON API (7575) + Navigator (7500),
                         # runs Setup automatically
 ```
@@ -328,11 +373,22 @@ balance, so you'll see the numbers change live. (Each move creates a
 *fresh* trade and `CashHolding`; the old ones drop out of the active set.)
 
 > **Try to cheat first (optional):** in Alice's window, open her
-> **Alice-USD** `CashHolding` and exercise **`AdjustBalance`** directly
-> with `delta = 500000` — it **fails** authorization ("missing Oracle"). A
-> counterparty can't mint into or move its own account; a balance change
-> needs the owner *and* the oracle together, which only happens inside a
-> settlement below.
+> **Alice-USD** `CashHolding` and exercise **`CreditAccount`** directly
+> with `delta = 500000` — it **fails** authorization ("missing Bank"). A
+> counterparty can never fabricate balance out of thin air; only the
+> issuer can mint that way.
+>
+> **`Transfer`, by contrast, genuinely doesn't need the oracle** — moving
+> REAL balance a party already has needs no one else's consent, the same
+> as a real bank transfer. It's just not demoable from Navigator here:
+> Navigator submits `actAs` only (no `readAs`), and referencing a
+> *destination* account by key needs the submitter to already be able to
+> see it — Alice can't see Bob's account any more than the oracle could
+> see hers before it was made an observer (same rule, see "What
+> `CashHolding` maps to" above and [ARCHITECTURE.md](ARCHITECTURE.md)'s
+> "Authority vs. visibility"). See `IRSTest.daml`'s
+> `testOwnerCanTransferWithReadAs` for this exercised directly, with the
+> `readAs` a real client-side integration would supply.
 
 ## Part 1 — IRS lifecycle
 

@@ -219,23 +219,69 @@ testPartyCannotSettle = do
   submitMustFail f.alice do
     exerciseCmd f.tradeCid SettleCashflow with periodEnd = date 2026 Oct 20; observedRate = 0.035
 
--- Authorization guard: a counterparty cannot adjust its own cash account
--- directly (would let it mint into / drain its own balance out-of-band, and
--- strand the contract id the trade holds). AdjustBalance needs owner + oracle
--- together, which only ever co-occur inside an IRSTrade settlement.
-testPartyCannotAdjustOwnCash : Script ()
-testPartyCannotAdjustOwnCash = do
+-- Authorization guard: a counterparty cannot mint into its own cash
+-- account -- only the issuer can CreditAccount. Contrast the next test:
+-- moving REAL balance via Transfer is allowed unilaterally.
+testPartyCannotMintOwnCash : Script ()
+testPartyCannotMintOwnCash = do
   bank   <- allocateParty "Bank"
   alice  <- allocateParty "Alice"
   oracle <- allocateParty "Oracle"
   aliceCash <- submit bank do
     createCmd CashHolding with issuer = bank; owner = alice; label = "Alice-USD"; currency = USD; amount = 1000000.0; observers = [oracle]
-  -- Alice, submitting as only herself, can neither mint (credit) ...
+  -- Alice, submitting as only herself, cannot fabricate balance -- only
+  -- the issuer can mint (CreditAccount), modeling the custodian recording
+  -- a genuine incoming transfer rather than the owner just declaring one.
   submitMustFail alice do
-    exerciseCmd aliceCash AdjustBalance with delta = 500000.0
-  -- ... nor move her own funds without the oracle co-authorizing.
+    exerciseCmd aliceCash CreditAccount with delta = 500000.0
+
+-- Contrast the above: Alice CAN move her own real money to another real
+-- account, without the oracle co-authorizing anything -- `Transfer`
+-- debits her and credits Bob atomically, so it's never fabricating
+-- balance, just like a real bank transfer, and Bob doesn't need to
+-- separately consent to being paid. She DOES need `readAs: [bob]` to
+-- reference his account by key at all, though -- Alice submitting
+-- `actAs` alone can't even see it, same visibility rule as any
+-- fetchByKey (see ARCHITECTURE.md, "Authority vs. visibility"). That's
+-- the honest limit of "unilateral" here: no oracle/settlement machinery
+-- involved, but a plain Navigator submission (actAs only, no readAs)
+-- still can't send to an arbitrary party's account it has no visibility
+-- into -- it would need a readAs-capable client instead.
+testOwnerCanTransferWithReadAs : Script ()
+testOwnerCanTransferWithReadAs = do
+  bank   <- allocateParty "Bank"
+  alice  <- allocateParty "Alice"
+  bob    <- allocateParty "Bob"
+  oracle <- allocateParty "Oracle"
+  _ <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = alice; label = "Alice-USD"; currency = USD; amount = 1000000.0; observers = [oracle]
+  _ <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = bob; label = "Bob-USD"; currency = USD; amount = 0.0; observers = [oracle]
+
+  submitMulti [alice] [bob] do
+    exerciseByKeyCmd @CashHolding (CashAccountKey with issuer = bank; owner = alice; currency = USD)
+      Transfer with transferAmount = 300000.0; destination = CashAccountKey with issuer = bank; owner = bob; currency = USD
+
+  aliceBal <- balanceOf alice
+  bobBal <- balanceOf bob
+  assertMsg "Alice debited 300000" (aliceBal == 700000.0)
+  assertMsg "Bob credited 300000" (bobBal == 300000.0)
+
+-- Guard: can't transfer more than you have.
+testTransferInsufficientFundsFails : Script ()
+testTransferInsufficientFundsFails = do
+  bank   <- allocateParty "Bank"
+  alice  <- allocateParty "Alice"
+  bob    <- allocateParty "Bob"
+  oracle <- allocateParty "Oracle"
+  _ <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = alice; label = "Alice-USD"; currency = USD; amount = 1000.0; observers = [oracle]
+  _ <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = bob; label = "Bob-USD"; currency = USD; amount = 0.0; observers = [oracle]
+
   submitMustFail alice do
-    exerciseCmd aliceCash AdjustBalance with delta = -1.0
+    exerciseByKeyCmd @CashHolding (CashAccountKey with issuer = bank; owner = alice; currency = USD)
+      Transfer with transferAmount = 2000.0; destination = CashAccountKey with issuer = bank; owner = bob; currency = USD
 
 -- Sanity guard: an out-of-band rate (fat-fingered 3 = 300%) fails loudly
 -- rather than silently defaulting the trade.
