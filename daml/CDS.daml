@@ -1,0 +1,389 @@
+module CDS where
+
+-- Selective import: Types.daml's own LifecycleEvent already exports an
+-- unqualified MarginEvent constructor (part of IRS's sum type). CDS
+-- defines its OWN LifecycleEvent below, also with a MarginEvent
+-- constructor -- a plain `import Types` would collide. MarginRecord is
+-- reused as-is (variation margin is identical mechanics to IRS's), so it's
+-- imported explicitly; CDS's premium/credit-event records are local to
+-- this module, same reasoning.
+import Types (Currency, FixedLeg(..), MarginRecord(..), dayCountFraction)
+import Cash
+import Lifecycle
+
+-- Mirrors ISDA's Credit Default Swap: protectionBuyer pays a running
+-- premium (the spread) to protectionSeller in exchange for protection
+-- against a credit event on referenceEntity. Deliberately simplified --
+-- see README.md, "What's intentionally simplified".
+data CreditEvent
+  = Bankruptcy
+  | FailureToPay
+  | Restructuring
+  deriving (Eq, Show)
+
+-- A single settled premium period -- CDS's analogue of IRS's
+-- CashflowRecord, but one-directional (protectionBuyer always pays) and
+-- unnetted, since there's only one leg.
+data PremiumRecord = PremiumRecord
+  with
+    periodEnd  : Date
+    netPayment : Decimal
+    paidBy     : Party
+    paidTo     : Party
+  deriving (Eq, Show)
+
+-- The credit event trigger the oracle submits, plus the resulting payout.
+-- recoveryRate is a decimal fraction in [0,1] (the fraction of notional
+-- the reference entity's creditors are expected to recover); payout is
+-- cash-settled as notional * (1 - recoveryRate), no physical delivery of
+-- the defaulted obligation.
+data CreditEventRecord = CreditEventRecord
+  with
+    eventType    : CreditEvent
+    asOf         : Date
+    recoveryRate : Decimal
+    payout       : Decimal
+  deriving (Eq, Show)
+
+-- CDSTrade.history holds all three settlement kinds in one chronological
+-- audit trail, same shape as IRS's Types.LifecycleEvent (see there).
+data LifecycleEvent
+  = PremiumEvent PremiumRecord
+  | MarginEvent MarginRecord
+  | CreditEventEntry CreditEventRecord
+  deriving (Eq, Show)
+
+
+-- ============================================================
+-- Trade execution: propose -> accept
+-- ============================================================
+
+-- Proposer is always the protection buyer, counterparty always the
+-- protection seller -- same simplification IRS makes (proposer always
+-- becomes fixedRatePayer): no separate role-selection flag needed.
+template TradeProposal
+  with
+    proposer           : Party
+    counterparty        : Party
+    oracle              : Party
+    cashIssuer          : Party    -- custodian both parties settle through -- see Cash.daml's CashAccountKey
+    settlementCurrency  : Currency
+    notional            : Decimal
+    referenceEntity     : Text
+    premiumLeg          : FixedLeg
+    effectiveDate       : Date
+    maturityDate        : Date
+  where
+    signatory proposer
+    observer counterparty, oracle
+
+    ensure notional > 0.0
+        && maturityDate > effectiveDate
+        && premiumLeg.rate >= 0.0 && premiumLeg.rate <= 1.0
+
+    -- No cash account to name explicitly -- see IRS.daml's AcceptTrade for
+    -- the full reasoning, including why account existence is deliberately
+    -- NOT validated here (counterparty, this choice's submitter, has no
+    -- visibility into proposer's account).
+    choice AcceptTrade : ContractId CDSTrade
+      controller counterparty
+      do
+        create CDSTrade with
+          protectionBuyer = proposer
+          protectionSeller = counterparty
+          oracle
+          cashIssuer
+          settlementCurrency
+          notional
+          referenceEntity
+          premiumLeg
+          effectiveDate
+          maturityDate
+          lastSettledDate = effectiveDate
+          postedMarginByProtectionBuyer = 0.0
+          postedMarginByProtectionSeller = 0.0
+          history = []
+
+    choice RejectTrade : ()
+      controller counterparty
+      do pure ()
+
+
+-- ============================================================
+-- The live trade
+-- ============================================================
+
+template CDSTrade
+  with
+    protectionBuyer                 : Party
+    protectionSeller                : Party
+    oracle                          : Party
+    cashIssuer                      : Party
+    settlementCurrency              : Currency
+    notional                        : Decimal
+    referenceEntity                 : Text
+    premiumLeg                      : FixedLeg
+    effectiveDate                   : Date
+    maturityDate                    : Date
+    lastSettledDate                 : Date
+    postedMarginByProtectionBuyer   : Decimal
+    postedMarginByProtectionSeller  : Decimal
+    history                         : [LifecycleEvent]
+  where
+    signatory protectionBuyer, protectionSeller
+    observer oracle
+    ensure notional > 0.0
+
+    -- Periodic premium payment: one-directional (protectionBuyer always
+    -- pays protectionSeller the running spread), no netting -- contrast
+    -- IRS's SettleCashflow, which nets two legs against each other.
+    choice SettlePremium : Either (ContractId SettlementFailure) (ContractId CDSTrade)
+      with
+        periodEnd : Date
+      controller oracle
+      do
+        assertMsg "Period end must not be after maturity"
+          (periodEnd <= maturityDate)
+        assertMsg "Period end must be after the last settled date"
+          (periodEnd > lastSettledDate)
+
+        let dayFraction = dayCountFraction premiumLeg.dayCount lastSettledDate periodEnd
+            amount = premiumLeg.rate * notional * dayFraction
+            record = PremiumRecord with
+              periodEnd
+              netPayment = amount
+              paidBy = protectionBuyer
+              paidTo = protectionSeller
+
+        failed <- tryMoveCash protectionBuyer amount protectionBuyer protectionSeller cashIssuer settlementCurrency
+        case failed of
+          None -> do
+            tradeCid <- create this with
+              lastSettledDate = periodEnd
+              history = history ++ [PremiumEvent record]
+            pure (Right tradeCid)
+          Some available -> do
+            defCid <- create SettlementFailure with
+              protectionBuyer; protectionSeller
+              defaultingParty = protectionBuyer
+              amountOwed = amount
+              amountAvailable = available
+              context = "SettlePremium"
+              history
+            pure (Left defCid)
+
+    -- Variation margin -- identical mechanics to IRS.SettleMargin, just
+    -- against protectionBuyer/protectionSeller. Positive MTM favors
+    -- protectionBuyer, so protectionSeller posts to protectionBuyer.
+    choice SettleMargin : Either (ContractId SettlementFailure) (ContractId CDSTrade)
+      with
+        asOf         : Date
+        markToMarket : Decimal
+      controller oracle
+      do
+        assertMsg "Mark-to-market must be nonzero to move margin"
+          (markToMarket /= 0.0)
+        assertMsg "Mark-to-market magnitude must not exceed notional"
+          (abs markToMarket <= notional)
+
+        let amount = abs markToMarket
+            payer  = if markToMarket > 0.0 then protectionSeller else protectionBuyer
+            receiver = if payer == protectionBuyer then protectionSeller else protectionBuyer
+            record = MarginRecord with
+              asOf
+              markToMarket
+              netPayment = amount
+              paidBy = payer
+              paidTo = receiver
+
+        failed <- tryMoveCash payer amount protectionBuyer protectionSeller cashIssuer settlementCurrency
+        case failed of
+          None -> do
+            tradeCid <- create this with
+              postedMarginByProtectionBuyer = if payer == protectionBuyer then postedMarginByProtectionBuyer + amount else postedMarginByProtectionBuyer
+              postedMarginByProtectionSeller = if payer == protectionSeller then postedMarginByProtectionSeller + amount else postedMarginByProtectionSeller
+              history = history ++ [MarginEvent record]
+            pure (Right tradeCid)
+          Some available -> do
+            defCid <- create SettlementFailure with
+              protectionBuyer; protectionSeller
+              defaultingParty = payer
+              amountOwed = amount
+              amountAvailable = available
+              context = "SettleMargin"
+              history
+            pure (Left defCid)
+
+    -- Credit event: the oracle submits the trigger type, the date, and a
+    -- recovery rate; the contract computes the cash-settled payout
+    -- (notional * (1 - recoveryRate)) and moves it atomically from
+    -- protectionSeller to protectionBuyer. Consuming either way -- a
+    -- credit event is itself a terminal lifecycle event (unlike periodic
+    -- settlement, which continues), so there's no successor CDSTrade on
+    -- either branch: success creates CreditEventSettlement (the payout
+    -- receipt), failure to cover it creates SettlementFailure, same
+    -- default pattern as SettlePremium/SettleMargin above.
+    choice SettleCreditEvent : Either (ContractId SettlementFailure) (ContractId CreditEventSettlement)
+      with
+        eventType    : CreditEvent
+        asOf         : Date
+        recoveryRate : Decimal   -- decimal fraction in [0,1]
+      controller oracle
+      do
+        assertMsg "Credit event date must not be after maturity"
+          (asOf <= maturityDate)
+        assertMsg "recoveryRate must be a decimal fraction in [0, 1]"
+          (recoveryRate >= 0.0 && recoveryRate <= 1.0)
+
+        let payoutAmount = notional * (1.0 - recoveryRate)
+            record = CreditEventRecord with
+              eventType; asOf; recoveryRate; payout = payoutAmount
+
+        failed <- tryMoveCash protectionSeller payoutAmount protectionBuyer protectionSeller cashIssuer settlementCurrency
+        case failed of
+          None -> do
+            settlementCid <- create CreditEventSettlement with
+              protectionBuyer; protectionSeller
+              payout = record
+              history = history ++ [CreditEventEntry record]
+            pure (Right settlementCid)
+          Some available -> do
+            defCid <- create SettlementFailure with
+              protectionBuyer; protectionSeller
+              defaultingParty = protectionSeller
+              amountOwed = payoutAmount
+              amountAvailable = available
+              context = "SettleCreditEvent"
+              history
+            pure (Left defCid)
+
+    -- Novation and termination are inherited from Lifecycle.daml's
+    -- INovatable/ITerminable interfaces -- identical mechanics to IRS's,
+    -- see IRS.daml's own interface instances for the annotated version.
+    interface instance INovatable for CDSTrade where
+      view = VNovatable with
+        partyA = protectionBuyer
+        partyB = protectionSeller
+        oracle
+      toNovationProposal transferor transferee =
+        let remainingParty = if transferor == protectionBuyer then protectionSeller else protectionBuyer
+        in toInterface @INovationProposal $ NovationProposal with
+             orig = this; transferor; transferee; remainingParty
+
+    interface instance ITerminable for CDSTrade where
+      view = VTerminable with
+        partyA = protectionBuyer
+        partyB = protectionSeller
+        oracle
+      toTerminationProposal proposer =
+        let otherParty = if proposer == protectionBuyer then protectionSeller else protectionBuyer
+        in toInterface @ITerminationProposal $ TerminationProposal with
+             orig = this; proposer; otherParty
+
+
+-- ============================================================
+-- Novation: propose -> accept/reject -> confirm/decline (tri-party)
+-- ============================================================
+-- Same shape as IRS.daml's NovationProposal/NovationConfirmation -- see
+-- there for the full authority-carrying explanation.
+
+template NovationProposal
+  with
+    orig           : CDSTrade
+    transferor     : Party
+    transferee     : Party
+    remainingParty : Party
+  where
+    signatory (signatory orig)
+    observer transferee, orig.oracle
+
+    interface instance INovationProposal for NovationProposal where
+      view = VNovationProposal with
+        partyA = orig.protectionBuyer
+        partyB = orig.protectionSeller
+        oracle = orig.oracle
+        transferor; transferee; remainingParty
+      trade = toInterface @INovatable orig
+      toNovationConfirmation =
+        toInterface @INovationConfirmation $ NovationConfirmation with
+          orig; transferor; transferee; remainingParty
+
+
+template NovationConfirmation
+  with
+    orig           : CDSTrade
+    transferor     : Party
+    transferee     : Party
+    remainingParty : Party
+  where
+    signatory (signatory orig ++ [transferee])
+    observer orig.oracle
+
+    interface instance INovationConfirmation for NovationConfirmation where
+      view = VNovationConfirmation with
+        partyA = orig.protectionBuyer
+        partyB = orig.protectionSeller
+        oracle = orig.oracle
+        transferor; transferee; remainingParty
+      originalTrade = toInterface @INovatable orig
+      -- No cash account to swap any more -- see IRS.daml's
+      -- NovationConfirmation.substitute for the full reasoning.
+      substitute =
+        toInterface @INovatable $ orig with
+          protectionBuyer = if transferor == orig.protectionBuyer then transferee else orig.protectionBuyer
+          protectionSeller = if transferor == orig.protectionSeller then transferee else orig.protectionSeller
+
+
+-- ============================================================
+-- Early termination: propose -> accept/reject
+-- ============================================================
+
+template TerminationProposal
+  with
+    orig       : CDSTrade
+    proposer   : Party
+    otherParty : Party
+  where
+    signatory (signatory orig)
+    observer otherParty, orig.oracle
+
+    interface instance ITerminationProposal for TerminationProposal where
+      view = VTerminationProposal with
+        partyA = orig.protectionBuyer
+        partyB = orig.protectionSeller
+        oracle = orig.oracle
+        proposer; otherParty
+      terminatingTrade = toInterface @ITerminable orig
+
+
+-- ============================================================
+-- Terminal states
+-- ============================================================
+
+-- The credit event payout receipt: a cash-settled credit event ends the
+-- trade for good (no successor CDSTrade either way -- see
+-- SettleCreditEvent), so this just records what was paid and carries the
+-- prior history forward for the audit trail.
+template CreditEventSettlement
+  with
+    protectionBuyer  : Party
+    protectionSeller : Party
+    payout           : CreditEventRecord
+    history          : [LifecycleEvent]
+  where
+    signatory protectionBuyer, protectionSeller
+
+-- Created when a premium/margin/credit-event payment can't be covered by
+-- the defaulting party's account -- same terminal-by-construction pattern
+-- as IRS.SettlementFailure (see there).
+template SettlementFailure
+  with
+    protectionBuyer  : Party
+    protectionSeller : Party
+    defaultingParty  : Party
+    amountOwed       : Decimal
+    amountAvailable  : Decimal
+    context          : Text
+    history          : [LifecycleEvent]
+  where
+    signatory protectionBuyer, protectionSeller

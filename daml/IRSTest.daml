@@ -1,9 +1,10 @@
-module Test where
+module IRSTest where
 
 import DA.Date (Month(Jan, Feb, Mar, Apr, Jul, Oct), date)
 import Daml.Script
 import Cash
 import IRS
+import Lifecycle
 import Types
 
 -- Shared fixture: allocate parties, fund both accounts with `aliceAmt` /
@@ -12,6 +13,7 @@ data Fixture = Fixture with
   alice : Party
   bob : Party
   oracle : Party
+  bank : Party   -- the trade's cashIssuer -- reuse this, not a fresh allocateParty "Bank", for anything that needs to fund an account under the SAME issuer the trade settles through
   tradeCid : ContractId IRSTrade
 
 setupTrade : Decimal -> Decimal -> Script Fixture
@@ -21,9 +23,9 @@ setupTrade aliceAmt bobAmt = do
   bob    <- allocateParty "Bob"
   oracle <- allocateParty "Oracle"
 
-  aliceCash <- submit bank do
+  _ <- submit bank do
     createCmd CashHolding with issuer = bank; owner = alice; label = "Alice-USD"; currency = USD; amount = aliceAmt; observers = [oracle]
-  bobCash <- submit bank do
+  _ <- submit bank do
     createCmd CashHolding with issuer = bank; owner = bob; label = "Bob-USD"; currency = USD; amount = bobAmt; observers = [oracle]
 
   proposalCid <- submit alice do
@@ -31,17 +33,18 @@ setupTrade aliceAmt bobAmt = do
       proposer = alice
       counterparty = bob
       oracle
-      proposerCashCid = aliceCash
+      cashIssuer = bank
+      settlementCurrency = USD
       notional = 10000000.0
       fixedLeg = FixedLeg with
-        fixedRate = 0.04; dayCount = Thirty360; frequency = Quarterly
+        rate = 0.04; dayCount = Thirty360; frequency = Quarterly
       floatingLeg = FloatingLeg with
         floatingIndex = SOFR; spread = 0.0; dayCount = Act360; frequency = Quarterly
       effectiveDate = date 2026 Jul 20
       maturityDate = date 2027 Jul 20
 
-  tradeCid <- submit bob do exerciseCmd proposalCid AcceptTrade with counterpartyCashCid = bobCash
-  pure Fixture with alice; bob; oracle; tradeCid
+  tradeCid <- submit bob do exerciseCmd proposalCid AcceptTrade
+  pure Fixture with alice; bob; oracle; bank; tradeCid
 
 -- Helper: total balance a party can see across their CashHoldings.
 balanceOf : Party -> Script Decimal
@@ -94,7 +97,7 @@ testRejectTradeDeclinesProposal = do
   alice  <- allocateParty "Alice"
   bob    <- allocateParty "Bob"
   oracle <- allocateParty "Oracle"
-  aliceCash <- submit bank do
+  _ <- submit bank do
     createCmd CashHolding with issuer = bank; owner = alice; label = "Alice-USD"; currency = USD; amount = 1000000.0; observers = [oracle]
 
   proposalCid <- submit alice do
@@ -102,9 +105,10 @@ testRejectTradeDeclinesProposal = do
       proposer = alice
       counterparty = bob
       oracle
-      proposerCashCid = aliceCash
+      cashIssuer = bank
+      settlementCurrency = USD
       notional = 10000000.0
-      fixedLeg = FixedLeg with fixedRate = 0.04; dayCount = Thirty360; frequency = Quarterly
+      fixedLeg = FixedLeg with rate = 0.04; dayCount = Thirty360; frequency = Quarterly
       floatingLeg = FloatingLeg with floatingIndex = SOFR; spread = 0.0; dayCount = Act360; frequency = Quarterly
       effectiveDate = date 2026 Jul 20
       maturityDate = date 2027 Jul 20
@@ -288,24 +292,26 @@ testSecondPeriodUsesLastSettledDate = do
 testNovationConfirmReplacesParty : Script ()
 testNovationConfirmReplacesParty = do
   f <- setupTrade 1000000.0 1000000.0
-  bank <- allocateParty "Bank"
+  let bank = f.bank
   charlie <- allocateParty "Charlie"
-  charlieCash <- submit bank do
+  _ <- submit bank do
     createCmd CashHolding with issuer = bank; owner = charlie; label = "Charlie-USD"; currency = USD; amount = 1000000.0; observers = [f.oracle]
 
   proposalCid <- submit f.bob do
-    exerciseCmd f.tradeCid ProposeNovation with transferor = f.bob; transferee = charlie
+    exerciseCmd (toInterfaceContractId @INovatable f.tradeCid) ProposeNovation with transferor = f.bob; transferee = charlie
 
   confirmationCid <- submit charlie do
-    exerciseCmd proposalCid AcceptNovation with transfereeCashCid = charlieCash
+    exerciseCmd proposalCid AcceptNovation
 
-  newTradeCid <- submit f.alice do
+  newTradeCid <- fromInterfaceContractId @IRSTrade <$> submit f.alice do
     exerciseCmd confirmationCid ConfirmNovation
 
   Some trade <- queryContractId f.alice newTradeCid
   assertMsg "fixedRatePayer unchanged" (trade.fixedRatePayer == f.alice)
   assertMsg "floatingRatePayer is now Charlie" (trade.floatingRatePayer == charlie)
-  assertMsg "floatingRatePayerCashCid is Charlie's account" (trade.floatingRatePayerCashCid == charlieCash)
+  -- No cash-cid field to check any more (see Cash.daml's CashAccountKey) --
+  -- testSettleAfterNovationMovesCash below is what actually proves
+  -- Charlie's account is wired in, by moving real cash through it.
 
   liveTrades <- query @IRSTrade f.alice
   assertMsg "exactly one live trade (the novated one)" (length liveTrades == 1)
@@ -318,15 +324,15 @@ testNovationConfirmReplacesParty = do
 testNovationAcceptAloneDoesNotCreateTrade : Script ()
 testNovationAcceptAloneDoesNotCreateTrade = do
   f <- setupTrade 1000000.0 1000000.0
-  bank <- allocateParty "Bank"
+  let bank = f.bank
   charlie <- allocateParty "Charlie"
-  charlieCash <- submit bank do
+  _ <- submit bank do
     createCmd CashHolding with issuer = bank; owner = charlie; label = "Charlie-USD"; currency = USD; amount = 1000000.0; observers = [f.oracle]
 
   proposalCid <- submit f.bob do
-    exerciseCmd f.tradeCid ProposeNovation with transferor = f.bob; transferee = charlie
+    exerciseCmd (toInterfaceContractId @INovatable f.tradeCid) ProposeNovation with transferor = f.bob; transferee = charlie
   _ <- submit charlie do
-    exerciseCmd proposalCid AcceptNovation with transfereeCashCid = charlieCash
+    exerciseCmd proposalCid AcceptNovation
 
   liveTrades <- query @IRSTrade f.alice
   assertMsg "no live IRSTrade until the remaining party confirms" (null liveTrades)
@@ -338,17 +344,17 @@ testNovationAcceptAloneDoesNotCreateTrade = do
 testNovationDeclineRestoresTrade : Script ()
 testNovationDeclineRestoresTrade = do
   f <- setupTrade 1000000.0 1000000.0
-  bank <- allocateParty "Bank"
+  let bank = f.bank
   charlie <- allocateParty "Charlie"
-  charlieCash <- submit bank do
+  _ <- submit bank do
     createCmd CashHolding with issuer = bank; owner = charlie; label = "Charlie-USD"; currency = USD; amount = 1000000.0; observers = [f.oracle]
 
   proposalCid <- submit f.bob do
-    exerciseCmd f.tradeCid ProposeNovation with transferor = f.bob; transferee = charlie
+    exerciseCmd (toInterfaceContractId @INovatable f.tradeCid) ProposeNovation with transferor = f.bob; transferee = charlie
   confirmationCid <- submit charlie do
-    exerciseCmd proposalCid AcceptNovation with transfereeCashCid = charlieCash
+    exerciseCmd proposalCid AcceptNovation
 
-  restoredCid <- submit f.alice do
+  restoredCid <- fromInterfaceContractId @IRSTrade <$> submit f.alice do
     exerciseCmd confirmationCid DeclineNovation
 
   Some trade <- queryContractId f.alice restoredCid
@@ -366,14 +372,14 @@ testNovationDeclineRestoresTrade = do
 testOnlyRemainingPartyCanConfirmNovation : Script ()
 testOnlyRemainingPartyCanConfirmNovation = do
   f <- setupTrade 1000000.0 1000000.0
-  bank <- allocateParty "Bank"
+  let bank = f.bank
   charlie <- allocateParty "Charlie"
-  charlieCash <- submit bank do
+  _ <- submit bank do
     createCmd CashHolding with issuer = bank; owner = charlie; label = "Charlie-USD"; currency = USD; amount = 1000000.0; observers = [f.oracle]
   proposalCid <- submit f.bob do
-    exerciseCmd f.tradeCid ProposeNovation with transferor = f.bob; transferee = charlie
+    exerciseCmd (toInterfaceContractId @INovatable f.tradeCid) ProposeNovation with transferor = f.bob; transferee = charlie
   confirmationCid <- submit charlie do
-    exerciseCmd proposalCid AcceptNovation with transfereeCashCid = charlieCash
+    exerciseCmd proposalCid AcceptNovation
 
   submitMustFail f.bob do exerciseCmd confirmationCid ConfirmNovation
   submitMustFail charlie do exerciseCmd confirmationCid ConfirmNovation
@@ -386,16 +392,16 @@ testOnlyRemainingPartyCanConfirmNovation = do
 testSettleAfterNovationMovesCash : Script ()
 testSettleAfterNovationMovesCash = do
   f <- setupTrade 1000000.0 1000000.0
-  bank <- allocateParty "Bank"
+  let bank = f.bank
   charlie <- allocateParty "Charlie"
-  charlieCash <- submit bank do
+  _ <- submit bank do
     createCmd CashHolding with issuer = bank; owner = charlie; label = "Charlie-USD"; currency = USD; amount = 1000000.0; observers = [f.oracle]
 
   proposalCid <- submit f.bob do
-    exerciseCmd f.tradeCid ProposeNovation with transferor = f.bob; transferee = charlie
+    exerciseCmd (toInterfaceContractId @INovatable f.tradeCid) ProposeNovation with transferor = f.bob; transferee = charlie
   confirmationCid <- submit charlie do
-    exerciseCmd proposalCid AcceptNovation with transfereeCashCid = charlieCash
-  newTradeCid <- submit f.alice do
+    exerciseCmd proposalCid AcceptNovation
+  newTradeCid <- fromInterfaceContractId @IRSTrade <$> submit f.alice do
     exerciseCmd confirmationCid ConfirmNovation
 
   -- Positive MTM favors Alice (fixedRatePayer), so Charlie (now
@@ -419,9 +425,9 @@ testNovationRejectRestoresTrade = do
   charlie <- allocateParty "Charlie"
 
   proposalCid <- submit f.bob do
-    exerciseCmd f.tradeCid ProposeNovation with transferor = f.bob; transferee = charlie
+    exerciseCmd (toInterfaceContractId @INovatable f.tradeCid) ProposeNovation with transferor = f.bob; transferee = charlie
 
-  restoredCid <- submit charlie do
+  restoredCid <- fromInterfaceContractId @IRSTrade <$> submit charlie do
     exerciseCmd proposalCid RejectNovation
 
   Some trade <- queryContractId f.alice restoredCid
@@ -440,14 +446,14 @@ testNovationTransferorMustBeTradeParty = do
   f <- setupTrade 1000000.0 1000000.0
   charlie <- allocateParty "Charlie"
   submitMustFail f.oracle do
-    exerciseCmd f.tradeCid ProposeNovation with transferor = f.oracle; transferee = charlie
+    exerciseCmd (toInterfaceContractId @INovatable f.tradeCid) ProposeNovation with transferor = f.oracle; transferee = charlie
 
 -- Guard: the transferee can't already be a party to the trade.
 testNovationTransfereeMustNotAlreadyBeParty : Script ()
 testNovationTransfereeMustNotAlreadyBeParty = do
   f <- setupTrade 1000000.0 1000000.0
   submitMustFail f.bob do
-    exerciseCmd f.tradeCid ProposeNovation with transferor = f.bob; transferee = f.alice
+    exerciseCmd (toInterfaceContractId @INovatable f.tradeCid) ProposeNovation with transferor = f.bob; transferee = f.alice
 
 -- Authorization guard: only the transferee -- not the remaining
 -- counterparty -- can accept (or reject) a novation proposal, even though
@@ -455,14 +461,14 @@ testNovationTransfereeMustNotAlreadyBeParty = do
 testOnlyTransfereeCanAcceptNovation : Script ()
 testOnlyTransfereeCanAcceptNovation = do
   f <- setupTrade 1000000.0 1000000.0
-  bank <- allocateParty "Bank"
+  let bank = f.bank
   charlie <- allocateParty "Charlie"
-  charlieCash <- submit bank do
+  _ <- submit bank do
     createCmd CashHolding with issuer = bank; owner = charlie; label = "Charlie-USD"; currency = USD; amount = 1000000.0; observers = [f.oracle]
   proposalCid <- submit f.bob do
-    exerciseCmd f.tradeCid ProposeNovation with transferor = f.bob; transferee = charlie
+    exerciseCmd (toInterfaceContractId @INovatable f.tradeCid) ProposeNovation with transferor = f.bob; transferee = charlie
   submitMustFail f.alice do
-    exerciseCmd proposalCid AcceptNovation with transfereeCashCid = charlieCash
+    exerciseCmd proposalCid AcceptNovation
 
 -- Termination happy path: Alice proposes to end the trade; Bob accepts.
 -- No successor contract -- the trade is simply gone.
@@ -470,7 +476,7 @@ testTerminationAcceptEndsTrade : Script ()
 testTerminationAcceptEndsTrade = do
   f <- setupTrade 1000000.0 1000000.0
   proposalCid <- submit f.alice do
-    exerciseCmd f.tradeCid ProposeTermination with proposer = f.alice
+    exerciseCmd (toInterfaceContractId @ITerminable f.tradeCid) ProposeTermination with proposer = f.alice
   submit f.bob do
     exerciseCmd proposalCid AcceptTermination
 
@@ -484,9 +490,9 @@ testTerminationRejectRestoresTrade : Script ()
 testTerminationRejectRestoresTrade = do
   f <- setupTrade 1000000.0 1000000.0
   proposalCid <- submit f.alice do
-    exerciseCmd f.tradeCid ProposeTermination with proposer = f.alice
+    exerciseCmd (toInterfaceContractId @ITerminable f.tradeCid) ProposeTermination with proposer = f.alice
 
-  restoredCid <- submit f.bob do
+  restoredCid <- fromInterfaceContractId @IRSTrade <$> submit f.bob do
     exerciseCmd proposalCid RejectTermination
 
   Some trade <- queryContractId f.alice restoredCid
@@ -504,7 +510,7 @@ testTerminationProposerMustBeTradeParty : Script ()
 testTerminationProposerMustBeTradeParty = do
   f <- setupTrade 1000000.0 1000000.0
   submitMustFail f.oracle do
-    exerciseCmd f.tradeCid ProposeTermination with proposer = f.oracle
+    exerciseCmd (toInterfaceContractId @ITerminable f.tradeCid) ProposeTermination with proposer = f.oracle
 
 -- Authorization guard: only the OTHER party -- not the proposer itself --
 -- can accept (or reject) a termination proposal, even though the proposer
@@ -513,6 +519,6 @@ testOnlyOtherPartyCanAcceptTermination : Script ()
 testOnlyOtherPartyCanAcceptTermination = do
   f <- setupTrade 1000000.0 1000000.0
   proposalCid <- submit f.alice do
-    exerciseCmd f.tradeCid ProposeTermination with proposer = f.alice
+    exerciseCmd (toInterfaceContractId @ITerminable f.tradeCid) ProposeTermination with proposer = f.alice
   submitMustFail f.alice do
     exerciseCmd proposalCid AcceptTermination

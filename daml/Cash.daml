@@ -10,9 +10,12 @@ import Types (Currency)
 -- In a production system this would more likely be an external, standards-
 -- based token (e.g. a Canton Token Standard / CIP-56 asset representing a
 -- tokenized deposit or USDCx holding) rather than a bespoke template --
--- this local version exists purely so the IRS contract's margin/settlement
--- choices have something concrete to exercise against during dev.
+-- this local version exists purely so trades' margin/settlement choices
+-- have something concrete to exercise against during dev.
 
+-- One account is identified by (issuer, owner, currency) -- who holds it,
+-- with which custodian, in which currency -- not by a specific contract
+-- id. See CashAccountKey below for why that distinction matters.
 template CashHolding
   with
     issuer    : Party      -- e.g. the bank issuing the tokenized deposit
@@ -31,22 +34,32 @@ template CashHolding
 
     ensure amount >= 0.0
 
+    -- One account per (issuer, owner, currency) -- e.g. "Alice's USD
+    -- account at the Bank" -- rather than per contract instance. This is
+    -- what lets many independent trades reference "the same account"
+    -- safely: DAML's archive-and-recreate means every AdjustBalance
+    -- swaps in a brand new contract id, so anything that stored the OLD
+    -- id directly would go stale the instant any other trade settled
+    -- first. A key sidesteps that entirely -- see tryMoveCash below,
+    -- which resolves both parties' CURRENT accounts by key at the moment
+    -- of each settlement, and README.md's "What CashHolding maps to" for
+    -- the fuller design discussion (a hundred live trades against one
+    -- party can safely all reference this same key).
+    key CashAccountKey with issuer; owner; currency : CashAccountKey
+    maintainer key.issuer
+
     -- Debits or credits the balance in place (archive-and-recreate, since
-    -- DAML has no true mutation). This is the primitive the IRS trade's
-    -- atomic DvP is built on: one account per party, adjusted directly,
-    -- rather than splitting a holding into pieces per payment.
+    -- DAML has no true mutation). This is the primitive every product's
+    -- atomic DvP is built on.
     --
     -- Controlled by owner + observers (the settlement agent / oracle), NOT
     -- the owner alone. So a counterparty CANNOT move -- or mint into -- its
     -- own account unilaterally: a direct submit as just the owner (e.g. from
     -- Navigator) fails authorization because the oracle's authority is
-    -- missing. The balance only ever changes inside an IRSTrade settlement,
-    -- where the trade already carries the owner's signatory authority AND the
-    -- oracle is the controller of SettleCashflow/SettleMargin -- so both
-    -- required authorities are present together, and nowhere else. Keeping
-    -- the owner from adjusting on its own also stops the account being
-    -- archived out-of-band, which would strand the contract id the trade
-    -- holds and break the next settle with CONTRACT_NOT_FOUND.
+    -- missing. The balance only ever changes inside a trade's settlement
+    -- choice, where the trade already carries the owner's signatory
+    -- authority AND the oracle is the controller of that choice -- so both
+    -- required authorities are present together, and nowhere else.
     --
     -- (`observers` is [oracle] on every account created here; requiring the
     -- whole observer set to co-authorize keeps this one-controller-line fix
@@ -55,7 +68,7 @@ template CashHolding
     --
     -- `delta` positive = credit (receiver), negative = debit (payer). The
     -- `ensure amount >= 0.0` above (re-checked here) is what makes an
-    -- overdrawn debit fail -- the IRS choice checks the balance first and
+    -- overdrawn debit fail -- the caller checks the balance first and
     -- routes to default instead of letting this abort the transaction.
     choice AdjustBalance : ContractId CashHolding
       with
@@ -64,3 +77,51 @@ template CashHolding
       do
         assertMsg "Insufficient balance" (amount + delta >= 0.0)
         create this with amount = amount + delta
+
+data CashAccountKey = CashAccountKey
+  with
+    issuer   : Party
+    owner    : Party
+    currency : Currency
+  deriving (Eq, Show)
+
+
+-- ============================================================
+-- Shared DvP helper -- used by every product's settlement/margin choices
+-- (IRS.daml's SettleCashflow/SettleMargin, CDS.daml's
+-- SettlePremium/SettleMargin/SettleCreditEvent).
+-- ============================================================
+
+-- Attempts to move `amount` of cash from `payer` to the other party.
+-- Resolves both parties' CURRENT accounts by key (issuer, owner,
+-- currency) rather than by a stored contract id -- see CashHolding's key
+-- above for why. Returns:
+--   * None on success.
+--   * Some availableBalance when the payer's account can't cover the
+--     amount -- the caller turns this into a SettlementFailure record
+--     rather than aborting the transaction.
+--
+-- Authorization: this runs inside a trade choice, so the transaction
+-- already carries both parties' signatory authority; the AdjustBalance
+-- controller (the account owner, = payer or receiver) is therefore
+-- authorized without either party submitting. Visibility: the submitter
+-- (the oracle) must readAs both parties so both accounts are fetchable --
+-- see Setup / the JSON API oracle token.
+tryMoveCash
+  :  Party                -- payer
+  -> Decimal               -- amount (must be > 0)
+  -> Party -> Party        -- partyA, partyB
+  -> Party                 -- cash issuer (custodian both parties settle through)
+  -> Currency              -- settlement currency
+  -> Update (Optional Decimal)
+tryMoveCash payer amount partyA partyB issuer currency = do
+  let receiver = if payer == partyA then partyB else partyA
+      payerKey    = CashAccountKey with issuer; owner = payer; currency
+      receiverKey = CashAccountKey with issuer; owner = receiver; currency
+  (_, payerHolding) <- fetchByKey @CashHolding payerKey
+  if payerHolding.amount >= amount
+    then do
+      _ <- exerciseByKey @CashHolding payerKey AdjustBalance with delta = negate amount
+      _ <- exerciseByKey @CashHolding receiverKey AdjustBalance with delta = amount
+      pure None
+    else pure (Some payerHolding.amount)

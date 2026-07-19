@@ -58,10 +58,13 @@ data ReferenceRate
 -- Mirrors CDM's "FixedRateSpecification". No payer/receiver here, unlike
 -- CDM's real shape -- IRSTrade.fixedRatePayer/floatingRatePayer is the
 -- single source of truth for who pays which leg, so there's nothing to
--- duplicate (and no risk of the two disagreeing).
+-- duplicate (and no risk of the two disagreeing). Reused as-is for CDS's
+-- premium leg (CDSTrade.premiumLeg : FixedLeg) -- a CDS running spread is
+-- structurally the same "rate/dayCount/frequency" shape as a fixed coupon,
+-- just interpreted as e.g. 0.01 = 100bps instead of 0.04 = 4%.
 data FixedLeg = FixedLeg
   with
-    fixedRate : Decimal          -- e.g. 0.04 = 4%
+    rate      : Decimal          -- e.g. 0.04 = 4% (IRS fixed coupon) or 0.01 = 100bps (CDS spread)
     dayCount  : DayCountConvention
     frequency : Frequency
   deriving (Eq, Show)

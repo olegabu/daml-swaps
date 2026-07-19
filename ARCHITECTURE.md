@@ -1,11 +1,14 @@
 # Canton / DAML Architecture Notes
 
-Reference notes for whoever is building on this
-project, so contract and client code stays consistent with how Canton
-actually works rather than assumptions carried over from other DLT stacks
-(Ethereum, Hyperledger Fabric).
+Reference notes for whoever is building on this project, so contract and
+client code stays consistent with how Canton actually works rather than
+assumptions carried over from other DLT stacks (Ethereum, Hyperledger
+Fabric). Organized into **Common** concepts (apply to both IRS and CDS,
+and to Canton generally), then what's specific to **IRS** and **CDS**.
 
-## DAML authorization vocabulary
+## Common
+
+### DAML authorization vocabulary
 
 - **Signatory** — must consent for a contract to exist; bound by whatever
   the contract lets happen to them afterward.
@@ -15,6 +18,14 @@ actually works rather than assumptions carried over from other DLT stacks
 - **Choice** — the only way state changes. `consuming` (default) archives
   the contract; `nonconsuming` leaves it live (for repeatable actions like
   periodic settlement or margin calls).
+- **Interface** — a named, typed contract shape (a `viewtype` plus a set
+  of choices/methods) that a template can *implement*. A contract id can
+  be converted between its concrete template type and any interface it
+  implements (`toInterfaceContractId`/`fromInterfaceContractId`); a choice
+  declared on the interface can be exercised on the interface-typed
+  contract id, and its authorization follows the same
+  signatories-union-controllers rule as any template choice — see
+  "Shared lifecycle via interfaces" below.
 - Authorization is **non-transitive**: a signatory only pre-authorizes the
   *direct* consequences of a choice on their contract, not arbitrary
   downstream effects.
@@ -24,20 +35,100 @@ actually works rather than assumptions carried over from other DLT stacks
   they're on different participant nodes. See "Propose-accept: carrying
   authority across transactions" below.
 
-## Authority vs. visibility (two separate things)
+### Shared lifecycle via interfaces
+
+IRS and CDS are two economically different products, but their novation
+and termination mechanics — propose → accept/reject, then (for novation)
+confirm/decline by a third party — are *structurally identical*: same
+guards, same authority-carrying trick, same shape of "embed the original,
+recreate it verbatim on a decline." Rather than writing that logic twice
+under name-compatible-but-separate templates, `Lifecycle.daml` hosts it
+**once**, as two Daml interfaces (`INovatable`/`ITerminable` and their
+proposal/confirmation counterparts), and `IRSTrade`/`CDSTrade` each
+implement a handful of small per-product hooks.
+
+This is modeled directly on the Daml SDK's own `daml-intro-13` tutorial
+(`IAsset`/`Cash`/`NFT`, bundled with this project's pinned SDK 2.10.4),
+which solves the structurally identical problem — a shared
+transfer-proposal lifecycle across two heterogeneous asset templates —
+the same way: the interface hosts the generic choice bodies; each
+template implements small hooks (`setOwner`, `toTransferProposal`, ...)
+that touch its own real fields; the interface's choices are called with
+`this` as an explicit first argument (`toTransferProposal this newOwner`,
+not an implicit method-call syntax).
+
+The proposal/confirmation templates **embed the full underlying trade as
+a plain value field** (`orig : IRSTrade`, matching the tutorial's `cash :
+Cash`) — not a contract-id reference — so there's no staleness/race risk,
+and declining is just `create (trade this)` (recreating that embedded
+value verbatim, fresh contract id), no field-by-field reconstruction.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Trade: IRSTrade / CDSTrade
+
+    Trade --> NovationProposal: ProposeNovation (transferor)
+    NovationProposal --> NovationConfirmation: AcceptNovation (transferee)
+    NovationProposal --> Trade: RejectNovation (transferee)
+    NovationConfirmation --> Trade': ConfirmNovation (remainingParty)
+    NovationConfirmation --> Trade: DeclineNovation (remainingParty)
+
+    Trade --> TerminationProposal: ProposeTermination (proposer)
+    TerminationProposal --> [*]: AcceptTermination (otherParty)
+    TerminationProposal --> Trade: RejectTermination (otherParty)
+
+    Trade': [*]
+```
+
+**Why one interface method name can't be reused across two interfaces in
+the same module**: `INovationProposal` declares a method `trade :
+INovatable`; `ITerminationProposal` needed the analogous "give me back the
+embedded original" method but had to name it `terminatingTrade` instead —
+Daml interface method names share **one flat namespace per module**, not
+one scoped per interface (confirmed by the compiler: reusing `trade` in
+both produced "Multiple declarations of `trade`"). Two interfaces can
+each declare a `view` field of the same name inside their own `data
+V...` record — those are fine, since each lives in its own record type —
+but bare interface method names collide module-wide.
+
+**Entering via the interface needs an explicit conversion; the rest is
+free.** `ProposeNovation`/`ProposeTermination` are choices declared on
+`INovatable`/`ITerminable`, not on `IRSTrade`/`CDSTrade` directly, so
+exercising them the first time needs `toInterfaceContractId`:
+
+```haskell
+exerciseCmd (toInterfaceContractId @INovatable tradeCid) ProposeNovation with ...
+```
+
+(Daml has no instance letting an interface choice be exercised directly
+on the *template's own* contract id without this conversion — confirmed
+by the compiler: `No instance for (HasToAnyChoice CDSTrade ProposeNovation ...)`
+on the first attempt.) Every choice *after* that one chains for free,
+because each interface choice's own return type is already
+interface-typed (`ContractId INovationProposal`, then `ContractId
+INovationConfirmation`, then `ContractId INovatable`) — no repeated
+conversions needed mid-flow. The only other place a conversion is needed
+is the opposite direction: code that wants the concrete trade's own
+fields back (e.g. a test asserting on `trade.fixedRatePayer`) calls
+`fromInterfaceContractId @IRSTrade` on the final `ContractId INovatable`
+the flow hands back.
+
+### Authority vs. visibility (two separate things)
 
 A lesson this codebase validated concretely, worth stating plainly because
 they're easy to conflate:
 
 - **Authority** = who consents to a transaction. When a choice is
   exercised, the resulting subtree is authorized by (the contract's
-  signatories) ∪ (the choice's controllers). Because `IRSTrade` is signed
+  signatories) ∪ (the choice's controllers) — and this rule applies
+  identically whether the choice is declared on a template or inherited
+  from an interface the template implements. Because `IRSTrade` is signed
   by *both* `fixedRatePayer` and `floatingRatePayer`, any choice on it —
-  even one controlled by a third party like the oracle — already carries
-  both counterparties' authority. That's why the oracle can move *their*
-  cash: exercising `AdjustBalance` (controller = the account owner, i.e.
-  `fixedRatePayer` or `floatingRatePayer`) is authorized without either
-  party submitting anything.
+  even one controlled by a third party like the oracle, or one inherited
+  from `INovatable` — already carries both counterparties' authority.
+  That's why the oracle can move *their* cash: exercising `AdjustBalance`
+  (controller = the account owner) is authorized without either party
+  submitting anything.
 - **Visibility** = who can *see* a contract to act on it. Independent of
   authority. The submitting/reading parties must be stakeholders
   (signatory or observer) of any contract the transaction fetches or
@@ -49,17 +140,75 @@ they're easy to conflate:
 Two ways to grant the needed visibility: (a) the submitter reads-as the
 owners (`readAs` claims in the JWT / `submitMulti`), or (b) make the third
 party a declared **observer** on the asset. This project uses (b) — the
-oracle is an observer on both cash accounts — because it's explicit in the
+oracle is an observer on every cash account — because it's explicit in the
 data model and works from Navigator (which submits with `actAs` = only the
-logged-in party, no `readAs`). The trade-off: the oracle can then see both
-counterparties' balances, which for a settlement/calc agent is realistic.
+logged-in party, no `readAs`). The trade-off: the oracle can then see
+every counterparty's balance, which for a settlement/calc agent is
+realistic.
 
-## Propose-accept: carrying authority across transactions
+**The same rule applies to `fetchByKey`/`exerciseByKey`, not just
+`fetch`/`exercise` by contract id** — a lesson this codebase hit
+concretely when a first draft of `AcceptTrade` tried to validate that
+both the proposer's and counterparty's `CashHolding` already existed:
+
+```
+Attempt to fetch, lookup or exercise a key associated with a contract
+not visible to the committer.
+Contract: #0:0 (Cash:CashHolding)
+Key: issuer = 'Bank'; owner = 'Alice'; currency = USD
+actAs: 'Bob'; readAs:
+Stakeholders: 'Alice', 'Bank', 'Oracle'
+```
+
+`AcceptTrade` is submitted by `counterparty` (Bob), who is neither a
+signatory nor observer of *proposer's* (Alice's) account — only the
+oracle is. Authority wasn't the problem (the choice's own controller,
+`counterparty`, was correctly authorized); visibility was: a key lookup
+still has to resolve against contracts the **submitter** can actually
+see, the same constraint as any `fetch`. The fix was to drop that
+eager validation — `AcceptTrade` doesn't check either account exists,
+same as before this codebase used keys at all — and let a missing
+account surface naturally at the first real settlement, which the
+oracle submits and can see everything for. See `Cash.daml`'s
+`tryMoveCash` and README.md's "What `CashHolding` maps to" for the
+key design itself.
+
+**Where the key → contract id mapping actually lives.** There is no
+global key index, consistent with "No global ledger" below — each
+**participant** maintains its own local one, built incrementally from
+the transactions it's been privy to, with entries only for keys of
+contracts where a party it hosts is a stakeholder (exactly why Bob's
+participant had no entry for `(Bank, Alice, USD)` above). When the
+**submitting** participant interprets a `fetchByKey`/`exerciseByKey`,
+it resolves the key against its own local index to a concrete contract
+id, which becomes part of the transaction; every other informee
+participant then independently re-validates that resolution against
+*their* own local index during normal confirmation (the same "each
+recipient locally validates its own view" step in "Transaction flow"
+below) — so a stale local index causes a commit failure/retry, not
+silent corruption.
+
+The `maintainer` clause is what makes this resolvable at all in a
+system with no global authority: because a maintainer must be a
+signatory of any contract with that key, the maintainer's participant
+is *structurally guaranteed* to always know that key's current state —
+it's the one party the protocol can always ask "is this key currently
+live, and pointing to what?" Without a declared maintainer there'd be
+no guaranteed authority to ask. Concretely here, `CashAccountKey`'s
+`maintainer key.issuer` means **the Bank's participant is the
+authority for every `CashAccountKey` it maintains** — in this single-
+sandbox demo that's invisible (Bank/Alice/Bob/Oracle are all one
+participant), but in a real multi-participant deployment, a settlement
+between Alice and Bob would still need the Bank's participant reachable
+to resolve each key, exactly the operational dependency you'd expect a
+real custodian relationship to have.
+
+### Propose-accept: carrying authority across transactions
 
 A **single Daml transaction is submitted by one participant node**, which
 can only supply `actAs` authority for parties *it hosts* (and that the
 caller's token covers). A choice with two independent controllers on two
-different parties — e.g. this codebase's original
+different parties — e.g. an early, rejected draft of this codebase's
 
 ```haskell
 choice Novate : ContractId IRSTrade
@@ -69,40 +218,44 @@ choice Novate : ContractId IRSTrade
 
 — can therefore only ever be submitted directly when **both** parties are
 hosted on the same participant, because only then can one submission
-`actAs` both of them at once. `Daml Script`'s `submitMulti [bob, charlie] []
-…` (and this project's earlier `daml repl` novation demo) works *only*
-because the sandbox hosts every party on a single node — it is a testing
-convenience, not something a real cross-organization deployment can do.
-The moment Bob and Charlie sit on distinct participants (see "Sync domains
-/ Global Synchronizer" and `NEXT_STEPS.md` item 2), Bob's node cannot
-`actAs` Charlie, and a direct multi-controller choice like that becomes
-unsubmittable — full stop, not just inconvenient.
+`actAs` both of them at once. `Daml Script`'s `submitMulti [bob, charlie]
+[] …` works *only* because the sandbox hosts every party on a single
+node — it is a testing convenience, not something a real
+cross-organization deployment can do. The moment Bob and Charlie sit on
+distinct participants (see "Sync domains / Global Synchronizer" below),
+Bob's node cannot `actAs` Charlie, and a direct multi-controller choice
+like that becomes unsubmittable — full stop, not just inconvenient.
 
-The fix is to split one logically-joint action into **two sequential
-single-party transactions**, using a contract as the carrier that freezes
-the first party's authority so the second transaction can pick it up. When
-a later choice is exercised on that contract, the transaction's available
-authority = (the contract's **signatories**) ∪ (the choice's controllers)
-— so a party who is merely a *signatory* of the carrier contract
-contributes its authority to whatever that contract's controller-only
-choices do next, with no further submission from that party required.
-Nothing restricts this to two hops, either — chain it again and a third
-party's consent joins the same way. Three instances of this pattern in
-this codebase:
+The fix is to split one logically-joint action into **two or more
+sequential single-party transactions**, using a contract as the carrier
+that freezes an earlier party's authority so a later transaction can pick
+it up. When a later choice is exercised on that contract, the
+transaction's available authority = (the contract's **signatories**) ∪
+(the choice's **controllers**) — so a party who is merely a *signatory*
+of the carrier contract contributes its authority to whatever that
+contract's controller-only choices do next, with no further submission
+from that party required. Nothing restricts this to two hops either —
+chain it again and a third party's consent joins the same way. Three
+instances of this pattern in this codebase, all now implemented through
+`Lifecycle.daml`'s shared interfaces (see above) rather than duplicated
+per product:
 
 - **Trade execution** — `TradeProposal` (signatory = `proposer` alone) /
-  `AcceptTrade` (controller = `counterparty`). Accepting creates `IRSTrade`
-  signed by `{proposer, counterparty}`; available authority at that point =
-  `{proposer}` (from the proposal's signatory) ∪ `{counterparty}` (the
-  accept choice's controller) = exactly the two signatories needed. Neither
-  party ever needed to `actAs` the other.
+  `AcceptTrade` (controller = `counterparty`), duplicated per product
+  since there's no existing trade to embed yet at proposal time (see
+  "Qualified imports" below for why duplication here, specifically, is
+  fine). Accepting creates the live trade signed by both parties;
+  available authority at that point = `{proposer}` (from the proposal's
+  signatory) ∪ `{counterparty}` (the accept choice's controller) = exactly
+  the two signatories needed. Neither party ever needed to `actAs` the
+  other.
 
 - **Novation — tri-party, chained twice.** Real ISDA novations need three
   consents, not two: the **transferor** (stepping out), the **transferee**
   (stepping in), and the **remaining party** — whose counterparty credit
   risk changes as a result, so they get a genuine say, not just inherited
-  authority. That's `ProposeNovation` (a *consuming* choice on the live
-  `IRSTrade`, `controller transferor`) → `NovationProposal` →
+  authority. That's `ProposeNovation` (a *consuming* interface choice on
+  the live trade, `controller transferor`) → `NovationProposal` →
   `AcceptNovation` or `RejectNovation` (`controller transferee`) →
   `NovationConfirmation` → `ConfirmNovation` or `DeclineNovation`
   (`controller remainingParty`). `transferor`/`transferee` are ISDA's own
@@ -110,79 +263,134 @@ this codebase:
   work correctly:
 
   1. **Archiving the old trade needs no new authority.** Because
-     `ProposeNovation` is exercised *on* `IRSTrade`, whose signatories are
-     already `{fixedRatePayer, floatingRatePayer}`, the archive is
-     authorized regardless of which single party is the choice's controller
-     (see "Authority vs. visibility" above) — `transferor` alone is
-     enough to trigger it. This also fixes `remainingParty` for the whole
-     flow: it's computed once here (whichever of `fixedRatePayer`/
-     `floatingRatePayer` isn't `transferor`) and stored on `NovationProposal`,
-     the same way `TerminationProposal.otherParty` is.
-  2. **`AcceptNovation` can't create the final trade directly** — that would
-     silently skip the remaining party's consent, the exact gap a tri-party
-     flow exists to close. Instead it creates `NovationConfirmation`,
-     signed by all **three** parties at once: `{fixedRatePayer,
-     floatingRatePayer}` (= `{transferor, remainingParty}`, carried forward
-     from `NovationProposal`'s signatories) plus `transferee`, `AcceptNovation`'s
-     own controller. That three-way signature is available for free the
-     moment `AcceptNovation` runs — the same trick as step 1, one hop later.
+     `ProposeNovation` is exercised *on* the live trade (via its
+     `INovatable` interface contract id), whose signatories are already
+     both counterparties, the archive is authorized regardless of which
+     single party is the choice's controller (see "Authority vs.
+     visibility" above) — `transferor` alone is enough to trigger it.
+     This also fixes `remainingParty` for the whole flow: it's computed
+     once here (whichever counterparty isn't `transferor`) and stored on
+     `NovationProposal`, the same way `TerminationProposal`'s
+     `otherParty` is.
+  2. **`AcceptNovation` can't create the final trade directly** — that
+     would silently skip the remaining party's consent, the exact gap a
+     tri-party flow exists to close. Instead it creates a
+     `NovationConfirmation`, signed by all **three** parties at once: the
+     original trade's two signatories (= `{transferor, remainingParty}`,
+     carried forward from `NovationProposal`'s signatories) plus
+     `transferee`, `AcceptNovation`'s own controller. That three-way
+     signature is available for free the moment `AcceptNovation` runs —
+     the same trick as step 1, one hop later.
   3. **Both proposal-stage AND confirmation-stage rejection recreate the
      ORIGINAL trade, not just archive things.** `NovationProposal`'s
-     signatories carry `transferor`'s authority forward for `RejectNovation`
-     (transferee declines outright); `NovationConfirmation`'s signatories
-     carry it forward *again* for `DeclineNovation` (remaining party vetoes
-     even after the transferee already accepted) — in both cases recreating
-     `IRSTrade` signed by `{transferor, remainingParty}` without transferor
-     ever submitting a second (or third) time. `ConfirmNovation` needs only
-     `remainingParty`'s own authority plus `transferee`'s, carried forward
-     from `NovationConfirmation`'s signatories, to create the novated trade
+     signatories carry `transferor`'s authority forward for
+     `RejectNovation` (transferee declines outright); `NovationConfirmation`'s
+     signatories carry it forward *again* for `DeclineNovation` (remaining
+     party vetoes even after the transferee already accepted) — in both
+     cases recreating the original trade signed by `{transferor,
+     remainingParty}` without transferor ever submitting a second (or
+     third) time. `ConfirmNovation` needs only `remainingParty`'s own
+     authority plus `transferee`'s, carried forward from
+     `NovationConfirmation`'s signatories, to create the novated trade
      signed by `{remainingParty, transferee}`.
 
-  The result: `Novate`'s old single dual-controller choice becomes five
-  single-controller choices across three transactions, each submittable by
-  exactly one party from its own participant — no co-hosting required,
-  genuinely three-way consent, not two-way-plus-inherited-authority.
+  The result: a hypothetical single dual-controller `Novate` choice
+  becomes five single-controller choices across three transactions, each
+  submittable by exactly one party from its own participant, no
+  co-hosting required, genuinely three-way consent, not
+  two-way-plus-inherited-authority.
 
 - **Termination** — identical shape to the novation *proposal* stage, one
-  level simpler (no third party to chase):
-  `ProposeTermination` (`controller proposer`, consuming on `IRSTrade`) /
-  `AcceptTermination` or `RejectTermination` (both `controller
+  level simpler (no third party to chase): `ProposeTermination` (a
+  *consuming* interface choice on the live trade, `controller proposer`)
+  / `AcceptTermination` or `RejectTermination` (both `controller
   otherParty`) on the `TerminationProposal` it creates. `otherParty` is
-  computed once at proposal time (whichever of `fixedRatePayer` /
-  `floatingRatePayer` isn't `proposer`) and stored, same role
-  `transferee` plays for novation's first hop — `AcceptTermination` has
-  nothing left to do but archive the proposal (`pure ()`, no successor),
-  while `RejectTermination` recreates
+  computed once at proposal time (whichever counterparty isn't
+  `proposer`) and stored, same role `transferee` plays for novation's
+  first hop — `AcceptTermination` has nothing left to do but archive the
+  proposal (`pure ()`, no successor), while `RejectTermination` recreates
   the original trade exactly like `RejectNovation` does, for the same
-  reason: `TerminationProposal` carries both original signatories forward,
+  reason: `TerminationProposal` carries the original signatories forward,
   so the proposer never needs to submit again either way.
 
-  Both replacements retire this codebase's last two direct multi-controller
-  choices (the old `Novate` and `Terminate`) — every lifecycle choice is
-  now submittable by a single party from its own participant, no
-  co-hosting required anywhere in the trade's life.
+  Every lifecycle choice in this codebase — trade execution, novation,
+  termination — is submittable by a single party from its own
+  participant; no co-hosting required anywhere.
 
 For a genuinely **atomic** cross-participant multi-party transaction
-(rather than two sequential ones), Canton 3.x's external-party /
+(rather than several sequential ones), Canton 3.x's external-party /
 interactive-submission API lets each required party sign a prepared
 transaction hash with its own key before one combined submission — this
-project targets SDK 2.10.4, where propose-accept is the available pattern.
+project targets SDK 2.10.4, where propose-accept (now shared via
+interfaces for novation/termination) is the available pattern.
 
-## Oracle / calculation-agent pattern
+### Qualified imports: two products, one vocabulary
 
-`SettleCashflow` and `SettleMargin` are controlled *solely* by an oracle
-party that submits only an objective external number (a rate fixing, a
-mark-to-market) and never a party or contract ID — so it stays oblivious to
-counterparty identities. The contract itself derives who owes whom and by
-how much. This mirrors real practice: rate fixings come from an independent
-administrator, and for centrally-cleared trades the CCP computes and calls
-margin unilaterally. (For *uncleared* bilateral trades, margin is instead
-each party calculating independently and reconciling disputes — a
-deliberate simplification here.) Guarding these inputs against fat-fingers
-(e.g. a rate must be a decimal fraction in [0,1]) keeps a typo from
-silently defaulting the trade.
+`IRS.daml` and `CDS.daml` both define `TradeProposal`, `AcceptTrade`,
+`RejectTrade`, `NovationProposal`, `NovationConfirmation`,
+`TerminationProposal`, and `SettlementFailure` — same names, deliberately,
+because they play the same role in each product's lifecycle and there's
+no value in inventing product-prefixed names for structurally identical
+concepts. Any module that needs both (`Setup.daml`, and any future
+cross-product client code) imports them **qualified**:
 
-## Settlement / cash leg
+```haskell
+import qualified IRS
+import qualified CDS
+```
+
+and refers to `IRS.TradeProposal`, `CDS.TradeProposal`, etc. Modules that
+only ever touch one product (`IRSTest.daml` → IRS only, `CDSTest.daml` → CDS
+only) import unqualified as usual, since there's nothing to disambiguate.
+The one thing qualification does *not* fix is Daml interface method names
+sharing a flat per-module namespace (see "Shared lifecycle via
+interfaces" above) — that's a different, module-internal collision that
+qualified importing elsewhere can't help with, which is why
+`ITerminationProposal.terminatingTrade` had to be named distinctly from
+`INovationProposal.trade` inside `Lifecycle.daml` itself.
+
+`TradeProposal`/`SettlementFailure` stay duplicated per product rather
+than unified through an interface, unlike novation/termination: there's
+no existing trade to embed at proposal time (so the embedded-value
+trick doesn't apply), and `SettlementFailure.history` is genuinely
+differently-typed per product (IRS's `CashflowEvent`/`MarginEvent` vs.
+CDS's `PremiumEvent`/`MarginEvent`/`CreditEventEntry`) — unifying it would
+need the embedded-value trick applied to a type that doesn't have one
+natural underlying "trade" to embed.
+
+### Oracle / calculation-agent pattern
+
+Every settlement/margin/credit-event choice in both products is
+controlled *solely* by an oracle party that submits only an objective
+external number (a rate fixing, a mark-to-market, a recovery rate) and
+never a party or contract ID — so it stays oblivious to counterparty
+identities. The contract itself derives who owes whom and by how much.
+This mirrors real practice: rate fixings come from an independent
+administrator, and for centrally-cleared trades the CCP computes and
+calls margin unilaterally. (For *uncleared* bilateral trades, margin is
+instead each party calculating independently and reconciling disputes —
+a deliberate simplification here.) Guarding these inputs against
+fat-fingers (e.g. a rate or recovery rate must be a decimal fraction in
+`[0,1]`) keeps a typo from silently defaulting — or, for CDS's credit
+event, silently mis-paying — the trade.
+
+```mermaid
+sequenceDiagram
+    actor Oracle
+    participant Trade as IRSTrade / CDSTrade
+    participant PayerCash as Payer's CashHolding
+    participant ReceiverCash as Receiver's CashHolding
+
+    Note over Trade: signatories = both counterparties (authority already present)
+    Oracle->>Trade: exercise Settle... (controller = oracle)
+    Note over Oracle,Trade: available authority = signatories(Trade) ∪ {oracle}
+    Trade->>PayerCash: exercise AdjustBalance (delta = −amount)
+    Note over PayerCash: controller = owner :: observers -- owner's authority comes from Trade's signatories, oracle's from being an observer+controller
+    Trade->>ReceiverCash: exercise AdjustBalance (delta = +amount)
+    Trade-->>Oracle: new trade (or SettlementFailure if payer can't cover it)
+```
+
+### Settlement / cash leg
 
 DAML contracts don't move real money by themselves. Real settlement =
 transferring an on-ledger cash **token** (tokenized bank deposit, or a
@@ -193,16 +401,85 @@ holder a creditor of a private issuer — a materially weaker claim, worth
 being deliberate about which one this project's `CashHolding` is meant to
 stand in for.
 
-This project implements that atomic DvP: `SettleCashflow` / `SettleMargin`
-compute the amount, then debit the payer's `CashHolding` and credit the
-receiver's (via `AdjustBalance`) and recreate the trade — all in one
-transaction. If the payer's account can't cover the amount, the same
-transaction instead archives the trade into a terminal `SettlementFailure`
-(no successor `IRSTrade`, so the ledger structurally prevents any further
-lifecycle action). Each party keeps a single account; the trade stores
-both accounts' contract IDs and refreshes them on every settle.
+Both products implement that atomic DvP the same way, via **`Cash.daml`'s
+shared `tryMoveCash` helper**: given a payer, an amount, both parties'
+identities, and the trade's agreed `cashIssuer`/`settlementCurrency`, it
+resolves each party's **current** `CashHolding` by key
+(`fetchByKey`/`exerciseByKey` against `CashAccountKey = issuer + owner +
+currency`) and debits/credits it via `AdjustBalance`, returning `None` on
+success or the payer's actual available balance (`Some available`) on
+failure. Each product's settlement choice (`SettleCashflow`/`SettleMargin`
+for IRS, `SettlePremium`/`SettleMargin`/`SettleCreditEvent` for CDS)
+computes its own product-specific amount and direction, then hands off to
+`tryMoveCash` and recreates the trade (or, on `Some`, builds its own
+`SettlementFailure` — see "Qualified imports" above for why that record
+stays per-product). If the payer's account can't cover the amount, the
+same transaction instead archives the trade into a terminal
+`SettlementFailure` (no successor trade for IRS/CDS's periodic choices,
+so the ledger structurally prevents any further lifecycle action on that
+path).
 
-## Core concepts: 
+Crucially, **the trade itself stores no `ContractId CashHolding` at
+all** — only the `cashIssuer`/`settlementCurrency` it takes to build the
+key. Every settlement resolves each party's account fresh, so an
+arbitrary number of trades can safely settle through the same account:
+none of them holds a reference that could go stale. This wasn't the
+first design (an earlier version pinned a specific contract id per party
+per trade, which broke the instant a second trade shared an account —
+see README.md, "What `CashHolding` maps to," for the full story and the
+`daml-intro-3` tutorial this is modeled on); it's also why novation's
+`substitute` hook (see "Shared lifecycle via interfaces" above) only
+needs to swap a `Party` field these days, not a cash-cid alongside it —
+the transferee's account is just whatever `(cashIssuer, transferee,
+settlementCurrency)` resolves to at the next settlement.
+
+## IRS
+
+`SettleCashflow` is the one place IRS's economics differ from a simple
+one-directional transfer: it **nets two legs against each other** before
+moving cash, rather than moving a single leg's gross amount.
+
+```
+dayFraction = dayCountFraction fixedLeg.dayCount lastSettledDate periodEnd
+rateDiff    = fixedLeg.rate − observedRate
+netPayment  = |rateDiff| × notional × dayFraction
+direction   = if rateDiff ≥ 0 then fixedRatePayer → floatingRatePayer
+                               else floatingRatePayer → fixedRatePayer
+```
+
+Contrast CDS's `SettlePremium` below, which has no "other leg" to net
+against — the premium always flows the same direction. See `README.md`'s
+demo walkthrough for the worked numeric example (`Thirty360`, exact
+`90/360 = 0.25` quarters) and "What's intentionally simplified" for the
+single-day-count-convention caveat.
+
+## CDS
+
+The credit event is CDS's one choice with no IRS analogue: it's the only
+choice in either product that's **terminal regardless of outcome** — a
+credit event ends the trade whether the payout succeeds or the seller
+can't cover it, unlike periodic settlement/margin, where only the
+*failure* branch is terminal.
+
+```mermaid
+stateDiagram-v2
+    [*] --> CDSTrade
+    CDSTrade --> CDSTrade: SettlePremium / SettleMargin (success -- trade continues)
+    CDSTrade --> SettlementFailure: SettlePremium / SettleMargin (payer can't cover it)
+    CDSTrade --> CreditEventSettlement: SettleCreditEvent (seller covers the payout)
+    CDSTrade --> SettlementFailure: SettleCreditEvent (seller can't cover the payout)
+    SettlementFailure --> [*]
+    CreditEventSettlement --> [*]
+```
+
+`payout = notional × (1 − recoveryRate)`, moved atomically from
+`protectionSeller` to `protectionBuyer` via the same `tryMoveCash` helper
+IRS uses. See `README.md`'s demo for the worked example and "What's
+intentionally simplified" for what a real ISDA auction-settled credit
+event does differently (auction-discovered recovery rate, accrued-premium
+proration, no upfront-payment convention here).
+
+## Core concepts
 
 ### No global ledger
 

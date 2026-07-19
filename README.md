@@ -1,114 +1,218 @@
-# IRS on Canton/DAML — Dev Bootstrap
+# IRS and CDS on Canton/DAML
 
 ## What this is
 
-A learning/prototyping project: an Interest Rate Swap (IRS) modeled as DAML
-smart contracts, intended to run on Canton.
-The code is intentionally close to real derivatives lifecycle mechanics: execution,
-periodic settlement, variation margin, novation, and termination — with
-settlement modeled as **atomic delivery-versus-payment (DvP)**: cash moves
-in the *same transaction* as the trade's state update, never as a separate
-off-ledger step.
+A learning/prototyping project: an Interest Rate Swap (IRS) and a Credit
+Default Swap (CDS), both modeled as DAML smart contracts, intended to run
+on Canton. The code is intentionally close to real derivatives lifecycle
+mechanics: execution, periodic settlement, variation margin, novation, and
+termination — with settlement modeled as **atomic delivery-versus-payment
+(DvP)**: cash moves in the *same transaction* as the trade's state update,
+never as a separate off-ledger step.
+
+The two products share their novation and termination mechanics through a
+single Daml **interface** implementation (`Lifecycle.daml`) rather than
+two copies of the same logic — see "Modules" below and
+[ARCHITECTURE.md](ARCHITECTURE.md) for why and how.
 
 ## Roles
 
+### Common to both products
+
+- **Oracle** — the calculation/settlement agent. The *sole* controller of
+  every settlement/margin/credit-event choice. It submits only objective
+  external numbers (a rate fixing, a mark-to-market, a recovery rate); it
+  never names a party or a contract ID, so it stays oblivious to
+  counterparty identities. The contract itself derives who owes whom.
+  Observer on the trade and on every cash account involved (so it can see
+  them to move them — see [ARCHITECTURE.md](ARCHITECTURE.md)).
+- **Bank** — issuer of the tokenized cash accounts (`CashHolding`).
+
+### IRS
+
 - **`fixedRatePayer` / `floatingRatePayer`** — the two trade counterparties,
   named for which leg each one pays. Signatories of the trade.
-- **Oracle** — the calculation/settlement agent. The *sole* controller of
-  `SettleCashflow` and `SettleMargin`. It submits only objective external
-  numbers (a rate fixing, a mark-to-market); it never names a party or a
-  contract ID, so it stays oblivious to counterparty identities. The
-  contract derives who owes whom. Observer on the trade and on both cash
-  accounts (so it can see them to move them — see `ARCHITECTURE.md`).
-- **Bank** — issuer of the tokenized cash accounts (`CashHolding`).
+
+### CDS
+
+- **`protectionBuyer` / `protectionSeller`** — the two trade
+  counterparties. The buyer pays a running premium (the spread) for
+  protection against a credit event on a reference entity; the seller
+  collects the premium and is on the hook for the contingent payout if a
+  credit event occurs. Signatories of the trade.
 
 ## Modules
 
-`daml/` contains four modules:
+`daml/` contains eight modules:
 
-- **`Types.daml`** — supporting data types (FixedLeg, FloatingLeg,
-  CashflowRecord, MarginRecord) plus closed enums `DayCountConvention`,
-  `Frequency`, `Currency` (USD/EUR), and `ReferenceRate`
-  (SOFR/LIBOR/EURIBOR). `LifecycleEvent` is a sum type (`CashflowEvent
-  CashflowRecord | MarginEvent MarginRecord`) letting `IRSTrade.history` hold
-  both differently-shaped audit entries in one chronological list.
-  `dayCountFraction` implements `Act360`/`Act365`/`Thirty360` as real date
-  arithmetic (no holiday/business-day adjustment). Shaped like ISDA CDM's
-  auto-generated data classes in spirit, simplified. Not a copy of
-  ISDA/Digital Asset's actual CDM-DAML source.
-- **`Cash.daml`** — a minimal tokenized `CashHolding` (one account per
-  party, `label` for a human-readable alias, `observers` so the oracle can
-  see it). Its `AdjustBalance` choice debits/credits the balance in place;
-  this is the primitive the trade's atomic DvP is built on. It's controlled
-  by **owner + oracle together**, so a counterparty can't move (or mint into)
-  its own account unilaterally — the balance only ever changes inside a
-  settlement, where both authorities co-occur.
-- **`IRS.daml`** — the main contract:
-  - `TradeProposal` / `AcceptTrade` / `RejectTrade` — propose-accept execution;
-    each party names its own settlement account.
-  - `IRSTrade` — the live, dual-signatory contract, carrying both parties'
-    cash account IDs (kept fresh on every settle).
-  - `SettleCashflow` — oracle submits a `periodEnd` and the floating fixing;
-    the contract computes the real day-count fraction (`Types.daml`'s
-    `dayCountFraction`, from the trade's own tracked `lastSettledDate` to
-    `periodEnd`, under the fixed leg's `DayCountConvention`), nets the
-    coupon, moves cash atomically (DvP), advances `lastSettledDate`, and
-    appends a `CashflowEvent` to `history`. See the demo's "Periodic
-    settlement" section for the math.
+- **`Types.daml`** — supporting data types shared by both products:
+  `FixedLeg`, `FloatingLeg`, `CashflowRecord`, `MarginRecord` (IRS's own
+  `LifecycleEvent` sum type wraps the last two), plus closed enums
+  `DayCountConvention`, `Frequency`, `Currency` (USD/EUR), and
+  `ReferenceRate` (SOFR/LIBOR/EURIBOR). `dayCountFraction` implements
+  `Act360`/`Act365`/`Thirty360` as real date arithmetic (no
+  holiday/business-day adjustment). `FixedLeg` is reused as-is for CDS's
+  premium leg (`rate` = the running spread, e.g. `0.01` = 100bps) — same
+  `rate`/`dayCount`/`frequency` shape as an IRS fixed coupon, so there's no
+  parallel `PremiumLeg` type. Shaped like ISDA CDM's auto-generated data
+  classes in spirit, simplified. Not a copy of ISDA/Digital Asset's actual
+  CDM-DAML source.
+- **`Cash.daml`** — a minimal tokenized `CashHolding`, identified by a
+  **contract key** (`CashAccountKey` = issuer + owner + currency, not a
+  contract id — see "What `CashHolding` maps to" below), plus the shared
+  **`tryMoveCash`** DvP helper both products' settlement choices call
+  into, which resolves both parties' CURRENT accounts by key. Its
+  `AdjustBalance` choice debits/credits the balance in place; controlled
+  by **owner + oracle together**, so a counterparty can't move (or mint
+  into) its own account unilaterally — the balance only ever changes
+  inside a settlement, where both authorities co-occur.
+- **`Lifecycle.daml`** — Daml **interfaces** hosting the novation and
+  termination lifecycle, written once and shared by both `IRSTrade` and
+  `CDSTrade`: `INovatable`/`INovationProposal`/`INovationConfirmation` and
+  `ITerminable`/`ITerminationProposal`. Modeled directly on the Daml SDK's
+  own `daml-intro-13` tutorial (`IAsset`/`Cash`/`NFT`, bundled with this
+  project's pinned SDK 2.10.4) — see
+  [ARCHITECTURE.md](ARCHITECTURE.md), "Shared lifecycle via interfaces",
+  for the full design and why it's safe.
+- **`IRS.daml`** — the IRS-specific contract:
+  - `TradeProposal` / `AcceptTrade` / `RejectTrade` — propose-accept
+    execution; the proposal names the `cashIssuer` (custodian) and
+    `settlementCurrency` both parties will settle through — not a
+    specific account, which is resolved by key at every settlement (see
+    Cash.daml's `CashAccountKey`).
+  - `IRSTrade` — the live, dual-signatory contract. Implements
+    `INovatable`/`ITerminable` (novation/termination are inherited, not
+    hand-written here).
+  - `SettleCashflow` — oracle submits a `periodEnd` and the floating
+    fixing; the contract computes the real day-count fraction
+    (`Types.daml`'s `dayCountFraction`, from the trade's own tracked
+    `lastSettledDate` to `periodEnd`, under the fixed leg's
+    `DayCountConvention`), nets the two legs against each other, moves
+    cash atomically (DvP), advances `lastSettledDate`, and appends a
+    `CashflowEvent` to `history`.
   - `SettleMargin` — oracle submits an `asOf` date and the mark-to-market;
     the contract derives direction, moves variation margin atomically, and
-    appends a `MarginEvent` to `history` (same list `SettleCashflow` appends
-    to — see `Types.daml`'s `LifecycleEvent`). Also bumps
+    appends a `MarginEvent` to `history`. Also bumps
     `postedMarginByFixedRatePayer`/`postedMarginByFloatingRatePayer`, a
-    separate *cumulative, non-netted* running total per party — not to be
-    confused with the per-call `history` entries.
-  - `ProposeNovation` / `AcceptNovation` / `RejectNovation` /
-    `ConfirmNovation` / `DeclineNovation` — **tri-party** novation, one
-    single-party consent per step, named for the ISDA Novation Agreement
-    roles: the **transferor** proposes (controller = transferor alone); the
-    **transferee** then accepts, bringing its own account, or declines
-    outright (controller = transferee alone); then the **remaining party**
-    — whose counterparty credit risk changes as a result — gets the final
-    say, confirming or declining the now-accepted novation (controller =
-    remaining party alone). `AcceptNovation` doesn't create the novated
-    trade directly — it creates a `NovationConfirmation` awaiting the
-    remaining party's decision. See [ARCHITECTURE.md](ARCHITECTURE.md),
-    "Propose-accept: carrying authority across transactions", for how the
-    authority-carrying trick extends to a third sequential consent.
-  - `ProposeTermination` / `AcceptTermination` / `RejectTermination` —
-    propose-accept early termination: either party proposes (controller =
-    proposer alone); the other party then ends the trade for good, or
-    declines and the original trade is recreated unchanged (controller =
-    the other party alone). See [ARCHITECTURE.md](ARCHITECTURE.md),
-    "Propose-accept: carrying authority across transactions", for why both
-    of these replaced a direct dual-controller choice.
-  - `SettlementFailure` — terminal state created when a payer's account can't
-    cover what's owed; the trade is archived with no successor, so no
-    further lifecycle choices are structurally possible.
+    separate *cumulative, non-netted* running total per party.
+  - `NovationProposal` / `NovationConfirmation` / `TerminationProposal` —
+    slim templates whose `interface instance` blocks supply IRS's own
+    per-product hooks (the view, and the field-substitution logic); the
+    generic consent-flow choices themselves live in `Lifecycle.daml`.
+  - `SettlementFailure` — terminal state created when a payer's account
+    can't cover what's owed; the trade is archived with no successor, so
+    no further lifecycle choices are structurally possible.
+- **`CDS.daml`** — the CDS-specific contract, same shape as `IRS.daml`:
+  - `TradeProposal` / `AcceptTrade` / `RejectTrade` — same propose-accept
+    shape (same `cashIssuer`/`settlementCurrency` naming, no account to
+    pin); the proposer is always the protection buyer.
+  - `CDSTrade` — the live, dual-signatory contract. Implements
+    `INovatable`/`ITerminable` identically to `IRSTrade`.
+  - `SettlePremium` — oracle submits a `periodEnd`; the contract computes
+    the elapsed day-count fraction under the premium leg's convention and
+    moves the premium **one-directionally** (protection buyer always pays
+    protection seller — contrast IRS's two-leg netting) atomically,
+    appending a `PremiumEvent`.
+  - `SettleMargin` — identical mechanics to IRS's, against
+    `protectionBuyer`/`protectionSeller`.
+  - `SettleCreditEvent` — oracle submits a `CreditEvent` trigger
+    (`Bankruptcy`/`FailureToPay`/`Restructuring`), the date, and a
+    `recoveryRate`; the contract computes the cash-settled payout
+    (`notional * (1 - recoveryRate)`) and moves it atomically from seller
+    to buyer. **Consuming either way** — a credit event is itself a
+    terminal lifecycle event (unlike periodic settlement, which
+    continues): success creates `CreditEventSettlement` (the payout
+    receipt), failure to cover it creates `SettlementFailure` — no
+    successor `CDSTrade` on either branch.
+  - `CreditEventSettlement` — terminal receipt carrying the payout details
+    and the trade's prior `history`.
+  - CDS-specific types (`CreditEvent`, `PremiumRecord`,
+    `CreditEventRecord`, and CDS's own `LifecycleEvent` sum type —
+    `PremiumEvent` / `MarginEvent` / `CreditEventEntry`) live in
+    `CDS.daml` itself, not `Types.daml` — see
+    [ARCHITECTURE.md](ARCHITECTURE.md), "Qualified imports", for why.
 - **`Setup.daml`** — the init-script (wired via `daml.yaml`'s
   `init-script`, runs automatically on every `daml start`). Allocates
   Alice, Bob, Charlie, Bank, Oracle; registers them as Navigator/JSON API
-  users; funds Alice's, Bob's, and Charlie's accounts (1,000,000 USD each,
-  observed by the oracle — Charlie's is unattached to any trade, so he can
-  accept a novation later with no separate funding step); and strikes a
-  live `IRSTrade` via the real propose-accept flow (Alice/Bob only).
-- **`Test.daml`** — Daml Script tests (`daml test`, 26 tests), two kinds:
-  direct, ledger-free unit tests of `dayCountFraction` (`Act360`, `Act365`,
-  and `Thirty360`'s); and full lifecycle
-  tests covering every explicit choice at least once — trade
-  proposal/accept/**reject**, settlement moves cash (both `SettleCashflow`
-  and `SettleMargin`), insufficient funds → default (triggered from
-  **both** choices, since each builds its own `SettlementFailure` record), a
-  party can't self-submit, out-of-band rate / oversized MTM are rejected, a
-  stale `periodEnd` is rejected, a second period correctly nets from the
-  advanced `lastSettledDate`, novation and termination accept/reject/
-  authorization guards, and settlement working correctly **after** a
-  novation (proving the transferee's account is genuinely wired in, not
-  just structurally present as a field).
+  users; funds **one** `CashHolding` per party (Alice, Bob, Charlie — see
+  "What `CashHolding` maps to" below for why one account safely serves
+  both seeded trades, and any number more); and strikes **both** a live
+  `IRSTrade` and a live `CDSTrade` between Alice and Bob via the real
+  propose-accept flow, both settling through the same Bank/USD.
+- **`IRSTest.daml`** — IRS's Daml Script tests (29 tests): direct,
+  ledger-free unit tests of `dayCountFraction`, plus full lifecycle tests
+  covering every explicit choice at least once. Unchanged by the
+  interface retrofit — it never inspected `NovationProposal`/
+  `NovationConfirmation`'s own fields, only choice names/args and the
+  resulting trade, so it serves as a regression net.
+- **`CDSTest.daml`** — CDS's Daml Script tests (16 tests), mirroring
+  `IRSTest.daml`'s fixture pattern: trade proposal/accept/reject, premium
+  settlement, margin (happy path and default), novation and termination
+  (via the same shared interfaces), and the credit-event-specific cases
+  (payout success, default, out-of-band recovery rate rejected).
 
 All state changes follow DAML's archive-and-recreate pattern (no in-place
 mutation). See `ARCHITECTURE.md` for why, and for the broader Canton
 concepts this code assumes.
+
+### What `CashHolding` maps to
+
+An earlier version of this codebase stored a specific `ContractId
+CashHolding` on every trade, refreshing it on each settle. That breaks
+the moment two trades share an account: DAML's archive-and-recreate means
+`AdjustBalance` swaps in a brand-new contract id every time it runs, so
+whichever trade settles first silently strands every OTHER trade's stored
+id, and their next settlement fails `CONTRACT_NOT_FOUND`. The stopgap was
+giving every trade its **own segregated account** — workable for the two
+trades this demo seeds, but obviously wrong in general: a real trader can
+have hundreds of live positions, and nobody opens a hundred settlement
+accounts to hold them.
+
+The actual fix is a Daml **contract key** (`Cash.daml`'s
+`CashAccountKey` = issuer + owner + currency — see the SDK's own
+`daml-intro-3` tutorial for the pattern). `CashHolding` is now identified
+by that key, not by a contract id, so `Setup.daml` funds exactly **one**
+account per party, and both seeded trades — indeed, any number of
+trades — settle through it safely: `tryMoveCash` resolves each party's
+CURRENT account via `fetchByKey`/`exerciseByKey` at the moment of each
+settlement (see `IRS.daml`/`CDS.daml`'s `TradeProposal`, which names a
+`cashIssuer` and `settlementCurrency` rather than a specific account).
+Nothing is ever stored and later found stale.
+
+So what does `CashHolding` actually model? Two honest answers:
+
+- **As built here, a real bank/margin ACCOUNT** — one running cash
+  balance per (custodian, holder, currency) that many trades settle
+  against, the way a real CSA nets exposure across a whole counterparty
+  relationship (or a whole book) rather than being sharded per trade.
+  That's a fair simplification for demonstrating atomic DvP, and contract
+  keys are exactly the Daml mechanism that makes "many trades, one
+  account" correct.
+- **Not how a production token/holding actually works.** Real Canton
+  Token Standard (CIP-56) and Daml Finance `Holding` implementations are
+  closer to UTXOs than bank accounts: a party typically holds many small,
+  individually fungible holding contracts — one per lot — that get split,
+  merged, and locked as needed, rather than one mutable balance
+  archived-and-recreated on every move. `CashHolding`'s single
+  running-balance shape is a deliberate simplification for this
+  teaching/dev-bootstrap project; it demonstrates atomic DvP without
+  needing a full splitting/merging fungible-asset implementation on top.
+
+**A trade-off worth naming, not glossing over:** resolving a shared
+account by key means every trade settling through the SAME (issuer,
+owner, currency) contends for that one contract — Daml serializes
+concurrent transactions touching the same keyed contract, so a party with
+many trades settling in the same instant sees contention/retries there,
+not silent corruption. At this project's scale (one or two trades per
+party) that's a non-issue; a real high-throughput deployment would shard
+a party's flow across several accounts (still resolved by key — just
+*more* keys), not fall back to per-trade segregation.
+
+Bob's single account is funded far more heavily than Alice's
+(10,000,000 vs. 1,000,000): as the CDS **protection seller** he's on the
+hook for a credit event payout that can run up to the full notional, on
+top of his IRS margin/settlement flows through that same account —
+real protection sellers are capitalized against exactly this tail risk.
 
 ## Getting started
 
@@ -149,8 +253,8 @@ export PATH="$HOME/.daml/bin:$PATH"   # add to ~/.bashrc or ~/.zshrc
 From the project root:
 
 ```sh
-daml build              # compile the four modules to a DAR
-daml test               # run the Daml Script lifecycle tests
+daml build              # compile the eight modules to a DAR
+daml test               # run both products' Daml Script lifecycle tests (45 total)
 daml start              # sandbox + JSON API (7575) + Navigator (7500),
                         # runs Setup automatically
 ```
@@ -160,24 +264,33 @@ daml start              # sandbox + JSON API (7575) + Navigator (7500),
 
 - allocates **Alice, Bob, Charlie, Bank, Oracle** and registers a Navigator
   user for each (`alice`, `bob`, `charlie`, `bank`, `oracle`);
-- has the Bank fund **Alice**, **Bob**, and **Charlie** with **1,000,000
-  USD** each (oracle added as observer, so it can move them) — Charlie's
-  account sits ready for the novation step below, unattached to any trade;
-- strikes one live **`IRSTrade`** between **Alice and Bob** via the real
+- has the Bank fund **one account per party**: `Alice-USD` and `Charlie-USD`
+  (1,000,000 USD each), `Bob-USD` (10,000,000 USD — see "What
+  `CashHolding` maps to" above); Charlie's is unattached to any trade,
+  ready for the novation demo below;
+- strikes a live **`IRSTrade`** between **Alice and Bob** via the real
   propose→accept flow — 10,000,000 USD notional, Alice pays **4% fixed**,
-  Bob pays **SOFR** floating, quarterly, maturing 2027-07-20.
+  Bob pays **SOFR** floating, quarterly, maturing 2027-07-20, settling
+  through `Alice-USD`/`Bob-USD`;
+- strikes a live **`CDSTrade`** between **Alice and Bob** the same way,
+  through the SAME two accounts — 10,000,000 USD notional, Alice
+  (protection buyer) pays Bob (protection seller) a **100bps (1%)**
+  running premium on reference entity "Acme Corp", quarterly, maturing
+  2031-07-20.
 
-Leave `daml start` running; the demo below drives this seeded trade. The
+Leave `daml start` running; the demo below drives both seeded trades. The
 ledger/API ports it prints are: **6865** (gRPC Ledger API), **7575** (JSON
 API), **7500** (Navigator).
 
 ## Demo
 
-A guided walkthrough of the full lifecycle on the seeded trade: **daily
+A guided walkthrough of both products' full lifecycles: IRS's **daily
 margin in both directions**, a **periodic settlement**, then **novation**
-and **termination** — watching Alice's and Bob's cash balances move in
-real time. Every step is drivable from Navigator alone; nothing here needs
-`daml repl` or any other tool.
+and **termination** (Part 1) — then CDS's **premium settlement** and
+**credit event** (Part 2), which reuses the exact same novation/
+termination mechanics under the hood but isn't re-walked a second time in
+Navigator, since it's identical to Part 1's. Every step is drivable from
+Navigator alone; nothing here needs `daml repl` or any other tool.
 
 ### Open three windows, one identity each
 
@@ -201,22 +314,27 @@ In each window pick the matching user on Navigator's sign-in screen:
 
 | Window | Log in as | Watches |
 |--------|-----------|---------|
-| 1 | `alice`  | her `CashHolding` **Alice-USD** + the `IRSTrade` |
-| 2 | `bob`    | his `CashHolding` **Bob-USD** + the `IRSTrade` |
-| 3 | `oracle` | drives every settlement; sees both accounts + the trade |
+| 1 | `alice`  | her `CashHolding` (shared by both trades) + both live trades |
+| 2 | `bob`    | his `CashHolding` (shared by both trades) + both live trades |
+| 3 | `oracle` | drives every settlement; sees every account + both trades |
 
-Starting balances: **Alice-USD = 1,000,000**, **Bob-USD = 1,000,000**.
-Keep the two contracts visible in Alice's and Bob's windows — every step
-below archives-and-recreates them with a new balance, so you'll see the
-numbers change live. (Each move creates a *fresh* `IRSTrade` and
-`CashHolding`; the old ones drop out of the active set.)
+Starting balances: **Alice-USD = 1,000,000**, **Bob-USD = 10,000,000** —
+the SAME one account each, settling both the `IRSTrade` and the
+`CDSTrade` (see "What `CashHolding` maps to" above), so watch its balance
+carry forward across Part 1 and Part 2 below rather than resetting
+between them. Keep the account and the live trade visible in Alice's and
+Bob's windows — every step below archives-and-recreates them with a new
+balance, so you'll see the numbers change live. (Each move creates a
+*fresh* trade and `CashHolding`; the old ones drop out of the active set.)
 
 > **Try to cheat first (optional):** in Alice's window, open her
-> **Alice-USD** `CashHolding` and exercise **`AdjustBalance`** directly with
-> `delta = 500000` — it **fails** authorization ("missing Oracle"). A
+> **Alice-USD** `CashHolding` and exercise **`AdjustBalance`** directly
+> with `delta = 500000` — it **fails** authorization ("missing Oracle"). A
 > counterparty can't mint into or move its own account; a balance change
 > needs the owner *and* the oracle together, which only happens inside a
 > settlement below.
+
+## Part 1 — IRS lifecycle
 
 ### 1. Daily variation margin — direction A (Bob → Alice)
 
@@ -235,7 +353,7 @@ Result — cash moves atomically in the same transaction:
 | | Before | After |
 |---|--:|--:|
 | Alice-USD | 1,000,000 | **1,050,000** |
-| Bob-USD   | 1,000,000 | **950,000** |
+| Bob-USD   | 10,000,000 | **9,950,000** |
 
 Watch Alice's and Bob's windows update. The recreated trade also carries
 `postedMarginByFloatingRatePayer = 50000`, and appends a `MarginEvent` to
@@ -253,7 +371,7 @@ Next day the mark flips. On the current `IRSTrade`, exercise
 | | Before | After |
 |---|--:|--:|
 | Alice-USD | 1,050,000 | **1,020,000** |
-| Bob-USD   | 950,000 | **980,000** |
+| Bob-USD   | 9,950,000 | **9,980,000** |
 
 You've now seen margin flow **both directions** off one oracle-submitted
 number, with the contract deriving who owes whom. `history` now holds two
@@ -262,8 +380,11 @@ number, with the contract deriving who owes whom. `history` now holds two
 > **Fat-finger / default guards:** a `markToMarket` of `0`, or one whose
 > magnitude exceeds the 10,000,000 notional, is rejected outright. A move
 > larger than the payer's balance instead archives the trade into
-> **`SettlementFailure`** (no successor trade) — try `markToMarket = 9000000`
-> on a fresh run to see the default path.
+> **`SettlementFailure`** (no successor trade) — try `markToMarket =
+> -2000000` on a fresh run (favors Bob, so Alice pays) to see the default
+> path: Alice's fresh 1,000,000 can't cover it. (Bob's own balance is
+> deliberately hard to default this way in the guided demo — see "What
+> `CashHolding` maps to" above for why he's funded so much more heavily.)
 
 ### 3. Periodic settlement (the coupon / net payment)
 
@@ -298,7 +419,7 @@ seeded trade's fixed leg uses `Thirty360` (30/360: every month counted as
 | | Before | After |
 |---|--:|--:|
 | Alice-USD | 1,020,000 | **995,000** |
-| Bob-USD   | 980,000 | **1,005,000** |
+| Bob-USD   | 9,980,000 | **10,005,000** |
 
 The recreated trade advances `lastSettledDate` to `2026-10-20` and appends
 a `CashflowEvent` (wrapping a `CashflowRecord`: rate, net payment, who paid
@@ -333,9 +454,11 @@ Moving a party in or out of the trade needs **three** consents, real ISDA
 novation-style — the outgoing party, the incoming party, and the
 *remaining* party, whose counterparty credit risk changes as a result and
 who gets the final say. Each is still a single-party step via
-**propose-accept**, chained twice. See
-[ARCHITECTURE.md](ARCHITECTURE.md), "Propose-accept: carrying authority
-across transactions".
+**propose-accept**, chained twice, and — as of this version — the choices
+themselves (`ProposeNovation`/`AcceptNovation`/`ConfirmNovation`/etc.) are
+inherited from `Lifecycle.daml`'s shared interfaces rather than hand-written
+per product. See [ARCHITECTURE.md](ARCHITECTURE.md), "Shared lifecycle via
+interfaces" and "Propose-accept: carrying authority across transactions".
 
 Open a **fourth** Chrome profile for **Charlie** — `Setup.daml` already
 funded his **Charlie-USD** account (1,000,000 USD), unattached to any
@@ -363,10 +486,10 @@ stakeholder of anything trade-related) and appear as a proposal in
 **Charlie's** window (he's an observer of it).
 
 **Accept** — in **Charlie's** window, open the `NovationProposal` and
-exercise **`AcceptNovation`**:
-
-- `transfereeCashCid` = Charlie's **Charlie-USD** `CashHolding` contract ID
-  (open that contract in his window to copy it)
+exercise **`AcceptNovation`** (no arguments — Charlie doesn't name an
+account; his `Charlie-USD` is resolved automatically by key at the next
+settlement, same as everyone else's — see "What `CashHolding` maps to"
+above).
 
 This does **not** create the novated trade yet — check **Alice's** window:
 there is no live `IRSTrade` anywhere right now, for anyone. It creates a
@@ -393,13 +516,13 @@ not a cash payment). Charlie-USD still reads 1,000,000.
 Ending the trade early needs both current counterparties' consent, and
 it's propose-accept for the same reason novation is: `ProposeTermination`
 (controller = proposer alone) / `AcceptTermination` or `RejectTermination`
-(controller = the other party alone). See
-[ARCHITECTURE.md](ARCHITECTURE.md), "Propose-accept: carrying authority
-across transactions" — termination gets the identical treatment novation
-does, and the identical reasoning for why a direct `controller
-fixedRatePayer, floatingRatePayer` choice can't be submitted from a single
-Navigator window (or, in a real deployment, from a single participant at
-all).
+(controller = the other party alone) — also inherited from
+`Lifecycle.daml`. See [ARCHITECTURE.md](ARCHITECTURE.md), "Propose-accept:
+carrying authority across transactions" — termination gets the identical
+treatment novation does, and the identical reasoning for why a direct
+`controller fixedRatePayer, floatingRatePayer` choice can't be submitted
+from a single Navigator window (or, in a real deployment, from a single
+participant at all).
 
 Continuing from the novated trade above, the current counterparties are
 **Alice** and **Charlie** — both already have open windows.
@@ -422,14 +545,136 @@ from every window with no successor — the trade is over.
 > declining a novation. Either party can be the one to `ProposeTermination`
 > — it isn't limited to whoever proposed the most recent novation.
 
+## Part 2 — CDS lifecycle
+
+CDS's novation and termination work **exactly as walked above** — same
+choice names, same tri-party consent flow, same authority-carrying trick
+— because `CDSTrade` implements the identical `Lifecycle.daml` interfaces
+`IRSTrade` does. Nothing new to demo there; this part covers only what's
+actually different about CDS: **one-directional premium settlement** (no
+netting, contrast Part 1 §3) and the **credit event** trigger.
+
+`Alice-USD`/`Bob-USD` are the SAME accounts Part 1 just moved — the CDS
+trade was seeded from the start alongside the IRS one, settling through
+the identical `Bank`/`USD` (see "What `CashHolding` maps to" above). So
+the tables below continue from where Part 1 left off — **Alice-USD =
+995,000, Bob-USD = 10,005,000** — not the original 1,000,000/10,000,000,
+unless you've restarted `daml start` since.
+
+### 1. Premium settlement (the running spread)
+
+In the **oracle** window, on the current `CDSTrade`, exercise
+**`SettlePremium`**:
+
+- `periodEnd` = `2026-10-20`
+
+Unlike `SettleCashflow`, there's no `observedRate` to submit and no
+netting — the protection buyer always pays the protection seller:
+
+```
+dayFraction = dayCountFraction premiumLeg.dayCount lastSettledDate periodEnd
+premiumLeg.rate × notional × dayFraction = netPayment  → Alice (buyer) pays Bob (seller)
+```
+
+The seeded trade's premium leg is `Thirty360` at `1%` (100bps), so the
+same clean `90/360 = 0.25` fraction as Part 1 applies:
+
+```
+0.01 × 10,000,000 × 0.25 = 25,000  → Alice pays Bob
+```
+
+| | Before | After |
+|---|--:|--:|
+| Alice-USD | 995,000 | **970,000** |
+| Bob-USD   | 10,005,000 | **10,030,000** |
+
+The recreated trade advances `lastSettledDate` and appends a
+`PremiumEvent` to `history` — same rolling-schedule guard as
+`SettleCashflow`: re-submitting `periodEnd = 2026-10-20` a second time
+fails; the next quarter is `2027-01-20`.
+
+### 2. Variation margin
+
+Identical mechanics to Part 1 §1–2, against `protectionBuyer`/
+`protectionSeller` instead of `fixedRatePayer`/`floatingRatePayer` — not
+walked again here.
+
+### 3. Credit event (the contingent payout, terminal)
+
+The reason this product exists: a credit event on the reference entity.
+In the **oracle** window, on the current `CDSTrade`, exercise
+**`SettleCreditEvent`**:
+
+- `eventType` = `Bankruptcy` (or `FailureToPay` / `Restructuring`)
+- `asOf` = `2027-01-21`  (any date on/before maturity)
+- `recoveryRate` = `0.4`  (40% recovery — a **decimal fraction**, like
+  `observedRate`/`markToMarket` elsewhere)
+
+**Unlike every other choice in this codebase, this one is terminal no
+matter what happens** — a credit event ends the trade, it doesn't
+continue it. The payout is cash-settled (no physical delivery of the
+defaulted obligation):
+
+```
+payout = notional × (1 − recoveryRate) = 10,000,000 × (1 − 0.4) = 6,000,000  → Bob (seller) pays Alice (buyer)
+```
+
+| | Before | After |
+|---|--:|--:|
+| Alice-USD | 970,000 | **6,970,000** |
+| Bob-USD   | 10,030,000 | **4,030,000** |
+
+The `CDSTrade` is archived with **no successor** — check every window,
+it's simply gone — and a `CreditEventSettlement` receipt appears instead,
+carrying the `CreditEventRecord` (event type, date, recovery rate, payout
+amount) and the trade's prior `history` for the audit trail. This is why
+Bob's account was seeded so much more heavily than Alice's: as protection
+seller he's carrying contingent risk up to the full notional (at a 0%
+recovery, the whole 10,000,000), on top of everything else settling
+through that same account.
+
+> **Fat-finger guard:** a `recoveryRate` outside `[0, 1]` (e.g. `3.0`,
+> meant as "300%") is rejected outright, same reasoning as
+> `observedRate`/`markToMarket` elsewhere.
+>
+> **Default instead of payout:** if the protection seller's account can't
+> cover the payout, the same transaction archives the trade into
+> `SettlementFailure` instead of `CreditEventSettlement` — same pattern as
+> every other settlement default in this codebase, and still terminal
+> either way (no successor `CDSTrade`). Bob is deliberately well-funded
+> enough that this isn't reachable in the guided walkthrough itself
+> (10,000,000 covers even a 0%-recovery payout); see
+> `CDSTest.daml`'s `testCreditEventInsufficientDefaults` for this path
+> exercised directly, or lower Bob's starting balance in `Setup.daml` to
+> reach it here too.
+
 > The oracle always submits as itself (`actAs: [oracle]`) with no `readAs` —
-> it's a declared observer on both cash accounts, which is what lets it
+> it's a declared observer on every cash account, which is what lets it
 > *see* them in order to move them. See [ARCHITECTURE.md](ARCHITECTURE.md),
 > "Authority vs. visibility".
 
 ## What's intentionally simplified / left as TODO
 
-- `SettleCashflow`'s day-count fraction is now real date arithmetic
+### Both products
+
+- Mark-to-market and rate fixings (including CDS's `recoveryRate`) are
+  trusted oracle inputs; there's no on-ledger cross-check of the number
+  itself (a real deployment would use a signed/attested feed).
+- No grace period: a payer who can't cover a settlement/margin/credit-event
+  move fails immediately. Real CSAs allow a cure period (typically T+1)
+  before failure-to-pay escalates to a formal ISDA Master Agreement Event
+  of Default — what's modeled here (`SettlementFailure`) is closer to a
+  single settlement fail than that broader, more consequential concept.
+- `SettlementFailure` records the facts but doesn't route into any
+  default-management / close-out-auction logic.
+- `CashHolding` is a bespoke local template for dev purposes — a real
+  deployment would use an external, standards-based token (Canton Token
+  Standard / CIP-56) representing a tokenized deposit or similar. No
+  formal verification, no ISDA SIMM/margin-methodology integration yet.
+
+### IRS
+
+- `SettleCashflow`'s day-count fraction is real date arithmetic
   (`Types.daml`'s `dayCountFraction`: `Act360`/`Act365`/`Thirty360`), but
   with **no holiday calendars or business-day adjustment** — period
   boundaries are used exactly as submitted rather than rolled to the
@@ -440,20 +685,27 @@ from every window with no successor — the trade is over.
   rate-reset logic belong in an off-ledger pricing engine (e.g. something
   Strata-shaped) whose output the oracle brings on-ledger as a verified
   input — not computed inside the DAML choice itself.
-- No grace period: a payer who can't cover a settlement/margin move fails
-  immediately. Real CSAs allow a cure period (typically T+1) before
-  failure-to-pay escalates to a formal ISDA Master Agreement Event of
-  Default — what's modeled here (`SettlementFailure`) is closer to a single
-  settlement fail than that broader, more consequential concept.
-- `SettlementFailure` records the facts but doesn't route into any
-  default-management / close-out-auction logic.
-- Mark-to-market and rate fixings are trusted oracle inputs; there's no
-  on-ledger cross-check of the number itself (a real deployment would use
-  a signed/attested feed).
-- `CashHolding` is a bespoke local template for dev purposes — a real
-  deployment would use an external, standards-based token (Canton Token
-  Standard / CIP-56) representing a tokenized deposit or similar. No
-  formal verification, no ISDA SIMM/margin-methodology integration yet.
+
+### CDS
+
+- **Cash settlement only** — no physical delivery of the defaulted
+  obligation, and no auction-based ISDA-standard recovery-rate discovery
+  (a real CDS auction determines the recovery price via a dealer
+  auction process; here the oracle just submits a number).
+- **Credit event enum is a 3-item closed set** (`Bankruptcy` /
+  `FailureToPay` / `Restructuring`) — real ISDA definitions distinguish
+  further subtypes (e.g. Restructuring has multiple clause variants with
+  different triggering conditions across jurisdictions).
+- **No accrued-premium proration.** A real CDS settles accrued premium up
+  to the credit event date as part of the close-out; this model's
+  `SettleCreditEvent` moves only the contingent payout, with no
+  reconciliation of premium accrued since the last `SettlePremium`.
+- **No upfront-payment convention.** Standardized CDS (since the 2009 "Big
+  Bang" protocol) trade with a fixed coupon (e.g. 100bps or 500bps) plus
+  an upfront cash settlement to true up to the actual market spread; this
+  model only has the running premium.
+- **`referenceEntity` is a plain `Text`**, not a structured
+  legal-entity/RED-code reference.
 
 ## Goals
 

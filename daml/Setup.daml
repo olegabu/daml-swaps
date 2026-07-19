@@ -3,13 +3,19 @@ module Setup where
 import DA.Date (Month(Jul), date)
 import Daml.Script
 import Cash
-import IRS
+import qualified IRS
+import qualified CDS
 import Types
 
 -- Runs automatically on every `daml start` (wired via daml.yaml's
 -- `init-script`), before Navigator/JSON API come up, so Alice, Bob,
 -- Charlie and the Bank always exist on a fresh sandbox instead of
 -- requiring manual allocation.
+--
+-- IRS and CDS are qualified imports -- both modules define
+-- TradeProposal/AcceptTrade/NovationProposal/SettlementFailure etc. under
+-- the same names (see ARCHITECTURE.md, "Qualified imports: two products,
+-- one vocabulary"), so every reference below is IRS.Foo or CDS.Foo.
 setup : Script ()
 setup = do
   alice <- allocatePartyWithHint "Alice" (PartyIdHint "Alice")
@@ -30,51 +36,39 @@ setup = do
   createUser (User bankId (Some bank)) [CanActAs bank]
   createUser (User oracleId (Some oracle)) [CanActAs oracle]
 
-  -- Bank funds both counterparties first, so each has a settlement account
-  -- to name when the trade is struck (and something for the DvP to move).
-  aliceCash <- submit bank do
-    createCmd CashHolding with
-      issuer = bank
-      owner = alice
-      label = "Alice-USD"
-      currency = USD
-      amount = 1000000.0
-      observers = [oracle]
+  -- Bank funds ONE account per party -- CashHolding is keyed by (issuer,
+  -- owner, currency), not identified by contract id (see Cash.daml's
+  -- CashAccountKey), so any number of trades (both products, and any
+  -- number of instances of either) can safely settle against the same
+  -- account: every settlement resolves the CURRENT contract by key, so
+  -- there's no stored id to go stale. See README.md, "What CashHolding
+  -- maps to", for why this is the realistic shape (one settlement account
+  -- funding a trader's whole book) rather than one account per trade.
+  _ <- fundAccount bank alice oracle "Alice-USD" 1000000.0
+  -- Bob is the CDS protection SELLER: a credit event payout can run up to
+  -- the full notional (10,000,000, at a 0% recovery), on top of his IRS
+  -- and CDS margin/premium flows through the same account. Real
+  -- protection sellers are capitalized against exactly this tail risk.
+  _ <- fundAccount bank bob oracle "Bob-USD" 10000000.0
 
-  bobCash <- submit bank do
-    createCmd CashHolding with
-      issuer = bank
-      owner = bob
-      label = "Bob-USD"
-      currency = USD
-      amount = 1000000.0
-      observers = [oracle]
-
-  -- Charlie isn't a party to the seeded trade, but gets an account up front
-  -- so he can accept a novation as transferee (ProposeNovation /
-  -- AcceptNovation / ConfirmNovation).
-  _ <- submit bank do
-    createCmd CashHolding with
-      issuer = bank
-      owner = charlie
-      label = "Charlie-USD"
-      currency = USD
-      amount = 1000000.0
-      observers = [oracle]
+  -- Charlie isn't a party to either seeded trade, but gets an account up
+  -- front so he can accept a novation as transferee (the demo's novation
+  -- walkthrough uses the IRS trade only; see README.md).
+  _ <- fundAccount bank charlie oracle "Charlie-USD" 1000000.0
 
   -- Seed a live IRSTrade via the real propose-accept flow (not a
   -- multi-party submit) so the demo exercises the same authorization
-  -- path a real counterparty negotiation would use. Each party names its
-  -- own settlement account.
-  proposalCid <- submit alice do
-    createCmd TradeProposal with
+  -- path a real counterparty negotiation would use.
+  irsProposalCid <- submit alice do
+    createCmd IRS.TradeProposal with
       proposer = alice
       counterparty = bob
       oracle
-      proposerCashCid = aliceCash
+      cashIssuer = bank
+      settlementCurrency = USD
       notional = 10000000.0
       fixedLeg = FixedLeg with
-        fixedRate = 0.04
+        rate = 0.04
         dayCount = Thirty360
         frequency = Quarterly
       floatingLeg = FloatingLeg with
@@ -86,6 +80,38 @@ setup = do
       maturityDate = date 2027 Jul 20
 
   _ <- submit bob do
-    exerciseCmd proposalCid AcceptTrade with counterpartyCashCid = bobCash
+    exerciseCmd irsProposalCid IRS.AcceptTrade
+
+  -- Seed a live CDSTrade the same way: Alice buys protection on a
+  -- reference entity from Bob, paying a 100bps running premium quarterly.
+  cdsProposalCid <- submit alice do
+    createCmd CDS.TradeProposal with
+      proposer = alice
+      counterparty = bob
+      oracle
+      cashIssuer = bank
+      settlementCurrency = USD
+      notional = 10000000.0
+      referenceEntity = "Acme Corp"
+      premiumLeg = FixedLeg with
+        rate = 0.01
+        dayCount = Thirty360
+        frequency = Quarterly
+      effectiveDate = date 2026 Jul 20
+      maturityDate = date 2031 Jul 20
+
+  _ <- submit bob do
+    exerciseCmd cdsProposalCid CDS.AcceptTrade
 
   pure ()
+
+fundAccount : Party -> Party -> Party -> Text -> Decimal -> Script (ContractId CashHolding)
+fundAccount bank owner oracle label amount =
+  submit bank do
+    createCmd CashHolding with
+      issuer = bank
+      owner
+      label
+      currency = USD
+      amount
+      observers = [oracle]

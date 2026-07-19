@@ -1,0 +1,147 @@
+module Lifecycle where
+
+-- Interfaces hosting the GENERIC, once-written novation/termination choice
+-- logic (guards, authorization shape, the multi-step consent flow) shared
+-- across every product (IRS, CDS). Each concrete trade type implements a
+-- small number of per-product hooks that touch its own real fields.
+-- Modeled directly on the Daml SDK's own daml-intro-13 tutorial
+-- (IAsset/Cash/NFT, bundled with this project's pinned SDK 2.10.4): a
+-- shared transfer-proposal lifecycle across heterogeneous templates.
+--
+-- Proposal/confirmation templates embed the full underlying trade as a
+-- plain VALUE (a field, not a contract-id reference) -- so there's no
+-- staleness/race risk, and declining is just recreating that embedded
+-- value. See ARCHITECTURE.md, "Propose-accept: carrying authority across
+-- transactions", for why a signatory carried forward on an embedded value
+-- lets a later single-party choice act with everyone's authority already
+-- present.
+
+-- ============================================================
+-- Novation: propose -> accept/reject -> confirm/decline (tri-party)
+-- ============================================================
+
+data VNovatable = VNovatable with
+    partyA : Party    -- IRS: fixedRatePayer, CDS: protectionBuyer
+    partyB : Party    -- IRS: floatingRatePayer, CDS: protectionSeller
+    oracle : Party
+  deriving (Eq, Show)
+
+interface INovatable where
+  viewtype VNovatable
+
+  -- Per-product hook: package myself + the proposed transfer into MY OWN
+  -- concrete NovationProposal type. Implemented once per product; this is
+  -- the only place that ever touches product-specific fields for novation.
+  toNovationProposal : Party -> Party -> INovationProposal
+
+  -- Generic, written ONCE. transferor's authority alone suffices to
+  -- trigger this because it's exercised ON the live trade, whose own
+  -- signatories (partyA, partyB) are already both present -- see
+  -- ARCHITECTURE.md, "Authority vs. visibility".
+  choice ProposeNovation : ContractId INovationProposal
+    with
+      transferor : Party
+      transferee : Party
+    controller transferor
+    do
+      assertMsg "Transferor must be a party to this trade"
+        (transferor == (view this).partyA || transferor == (view this).partyB)
+      assertMsg "Transferee must not already be a party to this trade"
+        (transferee /= (view this).partyA && transferee /= (view this).partyB)
+      create (toNovationProposal this transferor transferee)
+
+
+data VNovationProposal = VNovationProposal with
+    partyA, partyB, oracle : Party
+    transferor, transferee, remainingParty : Party
+  deriving (Eq, Show)
+
+interface INovationProposal where
+  viewtype VNovationProposal
+
+  trade : INovatable   -- the frozen original, embedded, not referenced
+
+  -- Per-product hook: build MY OWN concrete NovationConfirmation. No cash
+  -- account to name any more -- see Cash.daml's CashAccountKey: the
+  -- transferee's account is resolved by (issuer, transferee, currency) at
+  -- the next settlement, not chosen explicitly here.
+  toNovationConfirmation : INovationConfirmation
+
+  choice AcceptNovation : ContractId INovationConfirmation
+    controller (view this).transferee
+    do create (toNovationConfirmation this)
+
+  -- The original was embedded as a VALUE, never destroyed after being
+  -- frozen here -- declining just recreates that same value (fresh
+  -- contract id, same terms), no field-by-field reconstruction needed.
+  choice RejectNovation : ContractId INovatable
+    controller (view this).transferee
+    do create (trade this)
+
+
+data VNovationConfirmation = VNovationConfirmation with
+    partyA, partyB, oracle : Party
+    transferor, transferee, remainingParty : Party
+  deriving (Eq, Show)
+
+interface INovationConfirmation where
+  viewtype VNovationConfirmation
+
+  -- Per-product hook: swap transferor -> transferee and hand back a fresh
+  -- live contract of the SAME concrete type. The only place that
+  -- constructs a genuinely new trade with substituted fields.
+  substitute : INovatable
+
+  originalTrade : INovatable   -- for a decline, unchanged
+
+  choice ConfirmNovation : ContractId INovatable
+    controller (view this).remainingParty
+    do create (substitute this)
+
+  choice DeclineNovation : ContractId INovatable
+    controller (view this).remainingParty
+    do create (originalTrade this)
+
+
+-- ============================================================
+-- Early termination: propose -> accept/reject -- identical shape, one
+-- level simpler (no third party to chase).
+-- ============================================================
+
+data VTerminable = VTerminable with
+    partyA, partyB, oracle : Party
+  deriving (Eq, Show)
+
+interface ITerminable where
+  viewtype VTerminable
+
+  toTerminationProposal : Party -> ITerminationProposal
+
+  choice ProposeTermination : ContractId ITerminationProposal
+    with proposer : Party
+    controller proposer
+    do
+      assertMsg "Proposer must be a party to this trade"
+        (proposer == (view this).partyA || proposer == (view this).partyB)
+      create (toTerminationProposal this proposer)
+
+
+data VTerminationProposal = VTerminationProposal with
+    partyA, partyB, oracle, proposer, otherParty : Party
+  deriving (Eq, Show)
+
+interface ITerminationProposal where
+  viewtype VTerminationProposal
+
+  -- Named distinctly from INovationProposal's `trade` -- Daml interface
+  -- method names share one flat namespace across a module, not scoped
+  -- per-interface, so two interfaces can't both declare a bare `trade`.
+  terminatingTrade : ITerminable
+
+  choice AcceptTermination : ()
+    controller (view this).otherParty
+    do pure ()
+
+  choice RejectTermination : ContractId ITerminable
+    controller (view this).otherParty
+    do create (terminatingTrade this)

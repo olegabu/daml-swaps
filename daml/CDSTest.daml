@@ -1,0 +1,351 @@
+module CDSTest where
+
+import DA.Date (Month(Jan, Jul, Oct), date)
+import Daml.Script
+import Cash
+import CDS
+import Lifecycle
+-- Selective: Types' own MarginEvent (part of IRS's LifecycleEvent) would
+-- collide with CDS's own MarginEvent constructor otherwise -- see CDS.daml.
+import Types (Currency(..), DayCountConvention(..), Frequency(..), FixedLeg(..))
+
+-- Shared fixture: allocate parties, fund both accounts with `buyerAmt` /
+-- `sellerAmt`, strike the trade, return everything the tests need. Mirrors
+-- Test.daml's setupTrade -- see there for the IRS equivalent.
+data Fixture = Fixture with
+  alice : Party   -- protection buyer
+  bob   : Party   -- protection seller
+  oracle : Party
+  bank : Party   -- the trade's cashIssuer -- reuse this, not a fresh allocateParty "Bank", for anything that needs to fund an account under the SAME issuer the trade settles through
+  tradeCid : ContractId CDSTrade
+
+setupTrade : Decimal -> Decimal -> Script Fixture
+setupTrade buyerAmt sellerAmt = do
+  bank   <- allocateParty "Bank"
+  alice  <- allocateParty "Alice"
+  bob    <- allocateParty "Bob"
+  oracle <- allocateParty "Oracle"
+
+  _ <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = alice; label = "Alice-USD"; currency = USD; amount = buyerAmt; observers = [oracle]
+  _ <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = bob; label = "Bob-USD"; currency = USD; amount = sellerAmt; observers = [oracle]
+
+  proposalCid <- submit alice do
+    createCmd TradeProposal with
+      proposer = alice
+      counterparty = bob
+      oracle
+      cashIssuer = bank
+      settlementCurrency = USD
+      notional = 10000000.0
+      referenceEntity = "Acme Corp"
+      premiumLeg = FixedLeg with
+        rate = 0.01; dayCount = Thirty360; frequency = Quarterly
+      effectiveDate = date 2026 Jul 20
+      maturityDate = date 2031 Jul 20
+
+  tradeCid <- submit bob do exerciseCmd proposalCid AcceptTrade
+  pure Fixture with alice; bob; oracle; bank; tradeCid
+
+-- Helper: total balance a party can see across their CashHoldings.
+balanceOf : Party -> Script Decimal
+balanceOf p = do
+  holdings <- query @CashHolding p
+  pure $ sum [c.amount | (_, c) <- holdings, c.owner == p]
+
+-- Counterparty can decline the initial trade proposal. No CDSTrade should
+-- ever come into existence.
+testRejectTradeDeclinesProposal : Script ()
+testRejectTradeDeclinesProposal = do
+  bank   <- allocateParty "Bank"
+  alice  <- allocateParty "Alice"
+  bob    <- allocateParty "Bob"
+  oracle <- allocateParty "Oracle"
+  _ <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = alice; label = "Alice-USD"; currency = USD; amount = 1000000.0; observers = [oracle]
+
+  proposalCid <- submit alice do
+    createCmd TradeProposal with
+      proposer = alice; counterparty = bob; oracle
+      cashIssuer = bank; settlementCurrency = USD
+      notional = 10000000.0
+      referenceEntity = "Acme Corp"
+      premiumLeg = FixedLeg with rate = 0.01; dayCount = Thirty360; frequency = Quarterly
+      effectiveDate = date 2026 Jul 20
+      maturityDate = date 2031 Jul 20
+
+  submit bob do exerciseCmd proposalCid RejectTrade
+
+  trades <- query @CDSTrade alice
+  assertMsg "no trade created after rejection" (null trades)
+
+-- Happy path: quarterly premium at 1% (100bps) on 10M, Thirty360, one
+-- clean quarter (90/360 = 0.25) -> 0.01 * 10M * 0.25 = 25,000, one-directional
+-- protectionBuyer -> protectionSeller, no netting.
+testSettlePremiumMovesCash : Script ()
+testSettlePremiumMovesCash = do
+  f <- setupTrade 1000000.0 1000000.0
+  res <- submit f.oracle do
+    exerciseCmd f.tradeCid SettlePremium with periodEnd = date 2026 Oct 20
+  case res of
+    Left _ -> abort "expected trade to continue, got default"
+    Right _ -> pure ()
+  aliceBal <- balanceOf f.alice
+  bobBal <- balanceOf f.bob
+  assertMsg "protection buyer (Alice) debited 25000" (aliceBal == 975000.0)
+  assertMsg "protection seller (Bob) credited 25000" (bobBal == 1025000.0)
+
+-- Margin: positive MTM favors protectionBuyer, so protectionSeller posts.
+-- Also checks the margin call lands on `history` as a MarginEvent.
+testSettleMarginMovesCash : Script ()
+testSettleMarginMovesCash = do
+  f <- setupTrade 1000000.0 1000000.0
+  res <- submit f.oracle do
+    exerciseCmd f.tradeCid SettleMargin with asOf = date 2026 Jul 20; markToMarket = 50000.0
+  tradeCid <- case res of
+    Left _ -> abort "expected trade to continue, got default"
+    Right cid -> pure cid
+  aliceBal <- balanceOf f.alice
+  bobBal <- balanceOf f.bob
+  assertMsg "protection buyer (Alice) credited 50000" (aliceBal == 1050000.0)
+  assertMsg "protection seller (Bob) debited 50000" (bobBal == 950000.0)
+
+  Some trade <- queryContractId f.alice tradeCid
+  case trade.history of
+    [MarginEvent m] -> do
+      assertMsg "recorded markToMarket" (m.markToMarket == 50000.0)
+      assertMsg "Bob paid" (m.paidBy == f.bob)
+      assertMsg "Alice received" (m.paidTo == f.alice)
+    _ -> abort "expected exactly one MarginEvent in history"
+
+-- Default: protectionSeller owes a margin it can't cover -> SettlementFailure.
+testInsufficientMarginDefaults : Script ()
+testInsufficientMarginDefaults = do
+  f <- setupTrade 1000000.0 10000.0   -- Bob only has 10k
+  res <- submit f.oracle do
+    exerciseCmd f.tradeCid SettleMargin with asOf = date 2026 Jul 20; markToMarket = 50000.0
+  case res of
+    Right _ -> abort "expected default, got a live trade"
+    Left defCid -> do
+      Some d <- queryContractId f.alice defCid
+      assertMsg "defaulting party is Bob" (d.defaultingParty == f.bob)
+      assertMsg "amount owed 50000" (d.amountOwed == 50000.0)
+      assertMsg "context is SettleMargin" (d.context == "SettleMargin")
+  trades <- query @CDSTrade f.alice
+  assertMsg "no live trade after default" (null trades)
+
+-- Default via SettlePremium: protectionBuyer can't cover the premium.
+-- 0.01 * 10M * 0.25 = 25,000, above Alice's 1,000 balance.
+testSettlePremiumInsufficientDefaults : Script ()
+testSettlePremiumInsufficientDefaults = do
+  f <- setupTrade 1000.0 1000000.0   -- Alice only has 1,000
+  res <- submit f.oracle do
+    exerciseCmd f.tradeCid SettlePremium with periodEnd = date 2026 Oct 20
+  case res of
+    Right _ -> abort "expected default, got a live trade"
+    Left defCid -> do
+      Some d <- queryContractId f.alice defCid
+      assertMsg "defaulting party is Alice" (d.defaultingParty == f.alice)
+      assertMsg "amount owed 25000" (d.amountOwed == 25000.0)
+      assertMsg "context is SettlePremium" (d.context == "SettlePremium")
+  trades <- query @CDSTrade f.alice
+  assertMsg "no live trade after default" (null trades)
+
+-- Authorization guard: a counterparty cannot self-submit a settlement.
+testPartyCannotSettle : Script ()
+testPartyCannotSettle = do
+  f <- setupTrade 1000000.0 1000000.0
+  submitMustFail f.alice do
+    exerciseCmd f.tradeCid SettlePremium with periodEnd = date 2026 Oct 20
+
+-- Guard: a periodEnd that isn't after lastSettledDate is rejected.
+testPeriodEndMustBeAfterLastSettled : Script ()
+testPeriodEndMustBeAfterLastSettled = do
+  f <- setupTrade 1000000.0 1000000.0
+  submitMustFail f.oracle do
+    exerciseCmd f.tradeCid SettlePremium with periodEnd = date 2026 Jul 20
+
+-- Second period settles from the ADVANCED lastSettledDate, nets the same
+-- amount again under Thirty360, same reasoning as IRS's equivalent test.
+testSecondPeriodUsesLastSettledDate : Script ()
+testSecondPeriodUsesLastSettledDate = do
+  f <- setupTrade 1000000.0 1000000.0
+  Right afterQ1 <- submit f.oracle do
+    exerciseCmd f.tradeCid SettlePremium with periodEnd = date 2026 Oct 20
+
+  submitMustFail f.oracle do
+    exerciseCmd afterQ1 SettlePremium with periodEnd = date 2026 Oct 20
+
+  res <- submit f.oracle do
+    exerciseCmd afterQ1 SettlePremium with periodEnd = date 2027 Jan 20
+  case res of
+    Left _ -> abort "expected Q2 to settle, got default"
+    Right _ -> pure ()
+  aliceBal <- balanceOf f.alice
+  assertMsg "Alice debited 25000 twice (Q1 + Q2)" (aliceBal == 950000.0)
+
+-- Credit event happy path: 40% recovery on 10M notional -> payout =
+-- 10M * (1 - 0.4) = 6,000,000, protectionSeller pays protectionBuyer, and
+-- the trade ends (no successor CDSTrade).
+testCreditEventPaysOutAndEndsTrade : Script ()
+testCreditEventPaysOutAndEndsTrade = do
+  f <- setupTrade 1000000.0 10000000.0
+  res <- submit f.oracle do
+    exerciseCmd f.tradeCid SettleCreditEvent with
+      eventType = Bankruptcy; asOf = date 2026 Oct 1; recoveryRate = 0.4
+  case res of
+    Left _ -> abort "expected credit event to settle, got default"
+    Right settlementCid -> do
+      Some s <- queryContractId f.alice settlementCid
+      assertMsg "payout is 6,000,000" (s.payout.payout == 6000000.0)
+      assertMsg "recoveryRate recorded" (s.payout.recoveryRate == 0.4)
+      assertMsg "eventType recorded" (s.payout.eventType == Bankruptcy)
+
+  aliceBal <- balanceOf f.alice
+  bobBal <- balanceOf f.bob
+  assertMsg "protection buyer (Alice) credited 6,000,000" (aliceBal == 7000000.0)
+  assertMsg "protection seller (Bob) debited 6,000,000" (bobBal == 4000000.0)
+
+  liveTrades <- query @CDSTrade f.alice
+  assertMsg "no live trade after credit event" (null liveTrades)
+
+-- Credit event default: protectionSeller can't cover the payout ->
+-- SettlementFailure, no CreditEventSettlement, no live trade either.
+testCreditEventInsufficientDefaults : Script ()
+testCreditEventInsufficientDefaults = do
+  f <- setupTrade 1000000.0 1000.0   -- Bob only has 1,000
+  res <- submit f.oracle do
+    exerciseCmd f.tradeCid SettleCreditEvent with
+      eventType = FailureToPay; asOf = date 2026 Oct 1; recoveryRate = 0.4
+  case res of
+    Right _ -> abort "expected default, got a settlement"
+    Left defCid -> do
+      Some d <- queryContractId f.alice defCid
+      assertMsg "defaulting party is Bob" (d.defaultingParty == f.bob)
+      assertMsg "amount owed 6,000,000" (d.amountOwed == 6000000.0)
+      assertMsg "context is SettleCreditEvent" (d.context == "SettleCreditEvent")
+  trades <- query @CDSTrade f.alice
+  assertMsg "no live trade after default" (null trades)
+
+-- Sanity guard: an out-of-band recovery rate (fat-fingered) fails loudly.
+testRecoveryRateOutOfBandRejected : Script ()
+testRecoveryRateOutOfBandRejected = do
+  f <- setupTrade 1000000.0 10000000.0
+  submitMustFail f.oracle do
+    exerciseCmd f.tradeCid SettleCreditEvent with
+      eventType = Restructuring; asOf = date 2026 Oct 1; recoveryRate = 3.0
+
+-- Tri-party novation happy path -- identical mechanics to IRS's, driven
+-- through the shared Lifecycle interfaces. Bob (protectionSeller) steps
+-- out for Charlie; Charlie accepts; Alice (remaining party) confirms.
+testNovationConfirmReplacesParty : Script ()
+testNovationConfirmReplacesParty = do
+  f <- setupTrade 1000000.0 1000000.0
+  let bank = f.bank
+  charlie <- allocateParty "Charlie"
+  _ <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = charlie; label = "Charlie-USD"; currency = USD; amount = 1000000.0; observers = [f.oracle]
+
+  proposalCid <- submit f.bob do
+    exerciseCmd (toInterfaceContractId @INovatable f.tradeCid) ProposeNovation with transferor = f.bob; transferee = charlie
+
+  confirmationCid <- submit charlie do
+    exerciseCmd proposalCid AcceptNovation
+
+  newTradeCid <- fromInterfaceContractId @CDSTrade <$> submit f.alice do
+    exerciseCmd confirmationCid ConfirmNovation
+
+  Some trade <- queryContractId f.alice newTradeCid
+  assertMsg "protectionBuyer unchanged" (trade.protectionBuyer == f.alice)
+  assertMsg "protectionSeller is now Charlie" (trade.protectionSeller == charlie)
+  -- No cash-cid field to check any more (see Cash.daml's CashAccountKey) --
+  -- testSettleAfterNovationMovesCash below is what actually proves
+  -- Charlie's account is wired in, by moving real cash through it.
+
+  liveTrades <- query @CDSTrade f.alice
+  assertMsg "exactly one live trade (the novated one)" (length liveTrades == 1)
+
+-- Novation decline (proposal stage): Charlie rejects outright, original
+-- trade recreated, still settleable afterward.
+testNovationRejectRestoresTrade : Script ()
+testNovationRejectRestoresTrade = do
+  f <- setupTrade 1000000.0 1000000.0
+  charlie <- allocateParty "Charlie"
+
+  proposalCid <- submit f.bob do
+    exerciseCmd (toInterfaceContractId @INovatable f.tradeCid) ProposeNovation with transferor = f.bob; transferee = charlie
+
+  restoredCid <- fromInterfaceContractId @CDSTrade <$> submit charlie do
+    exerciseCmd proposalCid RejectNovation
+
+  Some trade <- queryContractId f.alice restoredCid
+  assertMsg "protectionBuyer unchanged" (trade.protectionBuyer == f.alice)
+  assertMsg "protectionSeller restored to Bob" (trade.protectionSeller == f.bob)
+
+  res <- submit f.oracle do
+    exerciseCmd restoredCid SettlePremium with periodEnd = date 2026 Oct 20
+  case res of
+    Left _ -> abort "expected restored trade to still settle"
+    Right _ -> pure ()
+
+-- Termination happy path: Alice proposes to end the trade; Bob accepts.
+testTerminationAcceptEndsTrade : Script ()
+testTerminationAcceptEndsTrade = do
+  f <- setupTrade 1000000.0 1000000.0
+  proposalCid <- submit f.alice do
+    exerciseCmd (toInterfaceContractId @ITerminable f.tradeCid) ProposeTermination with proposer = f.alice
+  submit f.bob do
+    exerciseCmd proposalCid AcceptTermination
+
+  liveTrades <- query @CDSTrade f.alice
+  assertMsg "no live trade after termination" (null liveTrades)
+
+-- Termination decline: Bob rejects, original trade recreated, still
+-- settleable afterward.
+testTerminationRejectRestoresTrade : Script ()
+testTerminationRejectRestoresTrade = do
+  f <- setupTrade 1000000.0 1000000.0
+  proposalCid <- submit f.alice do
+    exerciseCmd (toInterfaceContractId @ITerminable f.tradeCid) ProposeTermination with proposer = f.alice
+
+  restoredCid <- fromInterfaceContractId @CDSTrade <$> submit f.bob do
+    exerciseCmd proposalCid RejectTermination
+
+  Some trade <- queryContractId f.alice restoredCid
+  assertMsg "protectionBuyer unchanged" (trade.protectionBuyer == f.alice)
+  assertMsg "protectionSeller unchanged" (trade.protectionSeller == f.bob)
+
+  res <- submit f.oracle do
+    exerciseCmd restoredCid SettlePremium with periodEnd = date 2026 Oct 20
+  case res of
+    Left _ -> abort "expected restored trade to still settle"
+    Right _ -> pure ()
+
+-- Confirms the transferee's account is genuinely wired in after a full
+-- tri-party novation: a real SettleMargin call afterward must move cash
+-- through Charlie's own account correctly.
+testSettleAfterNovationMovesCash : Script ()
+testSettleAfterNovationMovesCash = do
+  f <- setupTrade 1000000.0 1000000.0
+  let bank = f.bank
+  charlie <- allocateParty "Charlie"
+  _ <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = charlie; label = "Charlie-USD"; currency = USD; amount = 1000000.0; observers = [f.oracle]
+
+  proposalCid <- submit f.bob do
+    exerciseCmd (toInterfaceContractId @INovatable f.tradeCid) ProposeNovation with transferor = f.bob; transferee = charlie
+  confirmationCid <- submit charlie do
+    exerciseCmd proposalCid AcceptNovation
+  newTradeCid <- fromInterfaceContractId @CDSTrade <$> submit f.alice do
+    exerciseCmd confirmationCid ConfirmNovation
+
+  res <- submit f.oracle do
+    exerciseCmd newTradeCid SettleMargin with asOf = date 2026 Oct 21; markToMarket = 40000.0
+  case res of
+    Left _ -> abort "expected trade to continue, got default"
+    Right _ -> pure ()
+  aliceBal <- balanceOf f.alice
+  charlieBal <- balanceOf charlie
+  assertMsg "Alice credited 40000" (aliceBal == 1040000.0)
+  assertMsg "Charlie debited 40000 through his own account" (charlieBal == 960000.0)
