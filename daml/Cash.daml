@@ -86,12 +86,25 @@ template CashHolding
     -- destination account too -- see ARCHITECTURE.md, "Authority vs.
     -- visibility", for exactly how that propagates.
     --
-    -- Two real constraints worth naming, not glossing over: (1) `owner`
-    -- submitting directly (e.g. from Navigator) must already be able to
-    -- SEE `destination` -- a stakeholder of it, or the submission needs
-    -- `readAs` -- the same visibility rule as any fetchByKey (see
-    -- ARCHITECTURE.md); sending to an arbitrary party's account you have
-    -- no visibility into needs a readAs-capable client, not Navigator.
+    -- Two real constraints worth naming, not glossing over:
+    --
+    -- (1) `owner` submitting directly must already be able to SEE
+    -- `destination` -- a stakeholder of it -- for the same visibility
+    -- reason as any fetchByKey (see ARCHITECTURE.md). `readAs` only
+    -- fixes this within ONE participant (it scopes which of that
+    -- participant's own already-hosted parties' data a submission may
+    -- use -- it can't reach a genuinely different participant). Daml's
+    -- actual cross-participant mechanism, explicit contract disclosure,
+    -- doesn't help here either: it only covers fetch/exercise BY
+    -- CONTRACT ID, not exerciseByKey -- key lookups stay
+    -- stakeholder-only regardless of disclosure. So in a real deployment
+    -- with Alice and Bob on separate participants, "Alice transfers
+    -- straight to Bob" genuinely does not work as this choice is shaped;
+    -- see ARCHITECTURE.md, "Mint vs. transfer," for how to model a real
+    -- party-to-party payment instead (route it through `issuer`, which
+    -- already sees every account, or accept an explicit `ContractId`
+    -- fed by a disclosed contract instead of a key).
+    --
     -- (2) cross-issuer transfers don't work (the destination's issuer
     -- would need to separately authorize, and nothing here asks it to) --
     -- fine within this project (one shared Bank), but a real

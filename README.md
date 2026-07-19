@@ -259,6 +259,60 @@ own real money to any account they can see — no settlement, no oracle
 involved (see the demo's "Try to cheat first" callout below for exactly
 what that does and doesn't let you do from Navigator).
 
+**Why a plain Alice → Bob transfer fails outside this sandbox, and how to
+actually model one.** `IRSTest.daml`'s `testOwnerCanTransferWithReadAs`
+only works because this whole demo (and its test suite) runs on a
+**single participant** hosting Alice, Bob, the Bank, and the Oracle
+together — `readAs: [bob]` just grants Alice's submission permission to
+use data that ONE participant already has locally. In a **real
+deployment**, Alice and Bob are normally on *separate* participants
+(their own organizations' nodes), and neither visibility mechanism Daml
+actually offers closes that gap for `Transfer` as designed:
+
+- `readAs` doesn't reach across participants at all — it scopes which of
+  a participant's own already-locally-hosted parties' authority a
+  submission can use, not a way to pull data from a different node.
+- Daml's real cross-participant visibility mechanism — **explicit
+  contract disclosure**, where a stakeholder hands the submitter a signed
+  contract payload out-of-band (HTTPS, email, whatever), attached to the
+  command — doesn't help either, because it only works for plain
+  `fetch`/`exercise` **by contract id**. `Transfer`'s `destination :
+  CashAccountKey` resolves via `exerciseByKey`, and key-based lookups are
+  explicitly excluded from what disclosure can satisfy: Alice's
+  participant genuinely cannot resolve Bob's key, no matter what Bob
+  discloses to her.
+
+So `Transfer`, as designed, is a real party-to-party payment primitive
+only when both accounts already happen to be visible to the submitter —
+in a genuinely multi-participant deployment, "Alice submits `Transfer`
+straight to Bob" just doesn't work, and it's not a bug to fix so much as
+a structural consequence of contract keys being participant-local. Two
+ways to actually model a party-to-party payment correctly:
+
+- **Route it through the issuer (Bank)**, not the customer. Since
+  `issuer` is a signatory of every `CashHolding` in this project, the
+  Bank's own participant already has both accounts visible, by
+  construction — no disclosure or readAs needed. This is also the
+  realistic shape: a "send money" feature is normally the *custodian's*
+  own service executing the transfer (authorized by the customer's
+  `actAs`), not peer-to-peer visibility between two customers' own
+  nodes — exactly how a real bank wire, within or between banks, actually
+  works.
+- **Take an explicit `ContractId`, not a key, for the destination** — a
+  variant choice accepting `destinationCid : ContractId CashHolding` fed
+  by a disclosed contract Bob supplies fresh, instead of
+  `CashAccountKey`. This trades back some of the staleness-safety the key
+  design exists for (see "What `CashHolding` maps to" above), so it only
+  makes sense for a genuinely interactive, one-off flow — not a repeated
+  settlement primitive like `tryMoveCash`, which must always resolve
+  whatever the CURRENT account is without any hand-off dance.
+
+`tryMoveCash` itself never hits this problem: the oracle is already a
+declared observer on every account (visibility, not authority — see
+above), so the party actually submitting always has full visibility
+already, the same shape as "route it through a party that can see both
+sides."
+
 ## Getting started
 
 The only hard dependency is the **Daml SDK**; it bundles everything else
@@ -381,14 +435,18 @@ balance, so you'll see the numbers change live. (Each move creates a
 > **`Transfer`, by contrast, genuinely doesn't need the oracle** — moving
 > REAL balance a party already has needs no one else's consent, the same
 > as a real bank transfer. It's just not demoable from Navigator here:
-> Navigator submits `actAs` only (no `readAs`), and referencing a
-> *destination* account by key needs the submitter to already be able to
-> see it — Alice can't see Bob's account any more than the oracle could
-> see hers before it was made an observer (same rule, see "What
-> `CashHolding` maps to" above and [ARCHITECTURE.md](ARCHITECTURE.md)'s
-> "Authority vs. visibility"). See `IRSTest.daml`'s
-> `testOwnerCanTransferWithReadAs` for this exercised directly, with the
-> `readAs` a real client-side integration would supply.
+> Navigator submits `actAs` only, and referencing a *destination* account
+> by key needs the submitter to already be able to see it — Alice can't
+> see Bob's account any more than the oracle could see hers before it was
+> made an observer (same rule, see "What `CashHolding` maps to" above and
+> [ARCHITECTURE.md](ARCHITECTURE.md)'s "Authority vs. visibility"). See
+> `IRSTest.daml`'s `testOwnerCanTransferWithReadAs` for this exercised
+> directly with `readAs` — though note that's a **sandbox-only** fix:
+> `readAs` only reaches contracts your own participant already has, so it
+> works there purely because Alice and Bob happen to be co-hosted on one
+> participant. It's not a general fix for a real, separately-hosted
+> deployment — see "Why a plain Alice → Bob transfer fails outside this
+> sandbox" above for what actually would be.
 
 ## Part 1 — IRS lifecycle
 

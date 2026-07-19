@@ -141,16 +141,91 @@ they're easy to conflate:
   to do so — the exercise fails `CONTRACT_NOT_FOUND` / "not visible to the
   reading parties".
 
-Two ways to grant the needed visibility: (a) the submitter reads-as the
-owners (`readAs` claims in the JWT / `submitMulti`), or (b) make the third
-party a declared **observer** on the asset. This project uses (b) — the
-oracle is an observer on every cash account — because it's explicit in the
-data model and works from Navigator (which submits with `actAs` = only the
-logged-in party, no `readAs`). The trade-off: the oracle can then see
-every counterparty's balance, which for a settlement/calc agent is
-realistic. Note this is now **purely** a visibility grant — see "Mint vs.
-transfer" below for why the oracle needs no authorization role on
-`CashHolding` at all, only this one.
+Three ways to grant the needed visibility, two of which only work
+*within* one participant, one of which is the real cross-participant
+answer:
+
+- (a) the submitter reads-as the owners (`readAs` claims in the JWT /
+  `submitMulti`) — but this only lets a submission use data the
+  **submitting participant already has locally** (e.g. because it hosts
+  multiple parties); it is not a way to pull a contract from a
+  genuinely different participant, a distinction that matters a lot in
+  "Mint vs. transfer" below.
+- (b) make the third party a declared **observer** on the asset — this
+  project's choice for the oracle, because it's explicit in the data
+  model and works from Navigator (which submits with `actAs` = only the
+  logged-in party, no `readAs`). The trade-off: the oracle can then see
+  every counterparty's balance, which for a settlement/calc agent is
+  realistic. Note this is now **purely** a visibility grant — see "Mint
+  vs. transfer" below for why the oracle needs no authorization role on
+  `CashHolding` at all, only this one.
+- (c) **explicit contract disclosure** — a stakeholder hands the
+  submitter a signed contract payload out-of-band (HTTPS, email,
+  whatever it takes), which the submitter attaches to the command; this
+  is the actual mechanism for a genuinely different, unrelated
+  participant to reference a contract it was never naturally synced,
+  bypassing the normal stakeholder check for that one submission. It has
+  a real limit worth knowing before reaching for it: it only covers
+  plain `fetch`/`exercise` **by contract id** — `fetchByKey`/
+  `exerciseByKey` stay stakeholder-only no matter what's disclosed (see
+  "Mint vs. transfer" below for exactly where that bites).
+
+**The same rule applies to `fetchByKey`/`exerciseByKey`, not just
+`fetch`/`exercise` by contract id** — a lesson this codebase hit
+concretely when a first draft of `AcceptTrade` tried to validate that
+both the proposer's and counterparty's `CashHolding` already existed:
+
+```
+Attempt to fetch, lookup or exercise a key associated with a contract
+not visible to the committer.
+Contract: #0:0 (Cash:CashHolding)
+Key: issuer = 'Bank'; owner = 'Alice'; currency = USD
+actAs: 'Bob'; readAs:
+Stakeholders: 'Alice', 'Bank', 'Oracle'
+```
+
+`AcceptTrade` is submitted by `counterparty` (Bob), who is neither a
+signatory nor observer of *proposer's* (Alice's) account — only the
+oracle is. Authority wasn't the problem (the choice's own controller,
+`counterparty`, was correctly authorized); visibility was: a key lookup
+still has to resolve against contracts the **submitter** can actually
+see, the same constraint as any `fetch`. The fix was to drop that
+eager validation — `AcceptTrade` doesn't check either account exists,
+same as before this codebase used keys at all — and let a missing
+account surface naturally at the first real settlement, which the
+oracle submits and can see everything for. See `Cash.daml`'s
+`tryMoveCash` and README.md's "What `CashHolding` maps to" for the
+key design itself.
+
+**Where the key → contract id mapping actually lives.** There is no
+global key index, consistent with "No global ledger" below — each
+**participant** maintains its own local one, built incrementally from
+the transactions it's been privy to, with entries only for keys of
+contracts where a party it hosts is a stakeholder (exactly why Bob's
+participant had no entry for `(Bank, Alice, USD)` above). When the
+**submitting** participant interprets a `fetchByKey`/`exerciseByKey`,
+it resolves the key against its own local index to a concrete contract
+id, which becomes part of the transaction; every other informee
+participant then independently re-validates that resolution against
+*their* own local index during normal confirmation (the same "each
+recipient locally validates its own view" step in "Transaction flow"
+below) — so a stale local index causes a commit failure/retry, not
+silent corruption.
+
+The `maintainer` clause is what makes this resolvable at all in a
+system with no global authority: because a maintainer must be a
+signatory of any contract with that key, the maintainer's participant
+is *structurally guaranteed* to always know that key's current state —
+it's the one party the protocol can always ask "is this key currently
+live, and pointing to what?" Without a declared maintainer there'd be
+no guaranteed authority to ask. Concretely here, `CashAccountKey`'s
+`maintainer key.issuer` means **the Bank's participant is the
+authority for every `CashAccountKey` it maintains** — in this single-
+sandbox demo that's invisible (Bank/Alice/Bob/Oracle are all one
+participant), but in a real multi-participant deployment, a settlement
+between Alice and Bob would still need the Bank's participant reachable
+to resolve each key, exactly the operational dependency you'd expect a
+real custodian relationship to have.
 
 ### Mint vs. transfer: two different authorization needs, two different choices
 
@@ -219,62 +294,47 @@ issuer` requirement would fail — correctly, since moving money between
 two actually-different custodians needs real interbank cooperation, not
 just the sender's say-so.
 
-**The same rule applies to `fetchByKey`/`exerciseByKey`, not just
-`fetch`/`exercise` by contract id** — a lesson this codebase hit
-concretely when a first draft of `AcceptTrade` tried to validate that
-both the proposer's and counterparty's `CashHolding` already existed:
+**Everything above is authority. `Transfer` also has a real visibility
+limit, already introduced above under "Authority vs. visibility" — and
+it's worse than it first looks for this specific choice: a plain "Alice
+sends money to Bob" genuinely does not work once Alice and Bob are on
+separate participants**, not just a sandbox inconvenience:
 
-```
-Attempt to fetch, lookup or exercise a key associated with a contract
-not visible to the committer.
-Contract: #0:0 (Cash:CashHolding)
-Key: issuer = 'Bank'; owner = 'Alice'; currency = USD
-actAs: 'Bob'; readAs:
-Stakeholders: 'Alice', 'Bank', 'Oracle'
-```
+- `readAs` (the fix `IRSTest.daml`'s `testOwnerCanTransferWithReadAs`
+  uses) only scopes which of the *submitting participant's own
+  already-locally-hosted* parties' data a command may use — it is not a
+  way to pull a contract from a genuinely different participant. It
+  "works" in that test only because Alice and Bob happen to be co-hosted
+  on the one sandbox participant.
+- Explicit contract disclosure — the real cross-participant mechanism
+  covered above — does *not* extend to `fetchByKey`/`exerciseByKey`. It
+  only covers plain `fetch`/`exercise` **by contract id** — key-based
+  lookups stay stakeholder-only no matter what's disclosed. Since
+  `Transfer.destination : CashAccountKey` resolves via `exerciseByKey`,
+  disclosure structurally cannot help it.
 
-`AcceptTrade` is submitted by `counterparty` (Bob), who is neither a
-signatory nor observer of *proposer's* (Alice's) account — only the
-oracle is. Authority wasn't the problem (the choice's own controller,
-`counterparty`, was correctly authorized); visibility was: a key lookup
-still has to resolve against contracts the **submitter** can actually
-see, the same constraint as any `fetch`. The fix was to drop that
-eager validation — `AcceptTrade` doesn't check either account exists,
-same as before this codebase used keys at all — and let a missing
-account surface naturally at the first real settlement, which the
-oracle submits and can see everything for. See `Cash.daml`'s
-`tryMoveCash` and README.md's "What `CashHolding` maps to" for the
-key design itself.
+So a real multi-participant deployment needs one of two different
+designs for genuine party-to-party payment, neither of which is what
+`Transfer` does today:
 
-**Where the key → contract id mapping actually lives.** There is no
-global key index, consistent with "No global ledger" below — each
-**participant** maintains its own local one, built incrementally from
-the transactions it's been privy to, with entries only for keys of
-contracts where a party it hosts is a stakeholder (exactly why Bob's
-participant had no entry for `(Bank, Alice, USD)` above). When the
-**submitting** participant interprets a `fetchByKey`/`exerciseByKey`,
-it resolves the key against its own local index to a concrete contract
-id, which becomes part of the transaction; every other informee
-participant then independently re-validates that resolution against
-*their* own local index during normal confirmation (the same "each
-recipient locally validates its own view" step in "Transaction flow"
-below) — so a stale local index causes a commit failure/retry, not
-silent corruption.
-
-The `maintainer` clause is what makes this resolvable at all in a
-system with no global authority: because a maintainer must be a
-signatory of any contract with that key, the maintainer's participant
-is *structurally guaranteed* to always know that key's current state —
-it's the one party the protocol can always ask "is this key currently
-live, and pointing to what?" Without a declared maintainer there'd be
-no guaranteed authority to ask. Concretely here, `CashAccountKey`'s
-`maintainer key.issuer` means **the Bank's participant is the
-authority for every `CashAccountKey` it maintains** — in this single-
-sandbox demo that's invisible (Bank/Alice/Bob/Oracle are all one
-participant), but in a real multi-participant deployment, a settlement
-between Alice and Bob would still need the Bank's participant reachable
-to resolve each key, exactly the operational dependency you'd expect a
-real custodian relationship to have.
+1. **Route it through `issuer`, not the customer.** Every `CashHolding`
+   in this project is signed by the same Bank party, so the Bank's own
+   participant already has both accounts visible by construction — no
+   `readAs` or disclosure needed. This is also just how real transfers
+   actually work: a "send money" feature is normally the *custodian's*
+   own service executing the move (authorized by the customer's
+   `actAs`), not two customers' nodes needing mutual visibility into each
+   other. `tryMoveCash` already gets this for free, incidentally — the
+   oracle is a declared observer on every account, so whoever submits a
+   settlement always already has full visibility, the same shape.
+2. **Take an explicit `ContractId`, not a key, for the destination** — a
+   variant choice with `destinationCid : ContractId CashHolding` fed by a
+   contract Bob discloses fresh right before submission, instead of
+   `CashAccountKey`. This gives up the staleness-safety the key design
+   exists for (see README.md, "What `CashHolding` maps to"), so it only
+   makes sense for a genuinely interactive, one-shot flow — never for a
+   repeated primitive like `tryMoveCash`, which must always resolve
+   whatever the CURRENT account is with no hand-off choreography.
 
 ### Propose-accept: carrying authority across transactions
 
