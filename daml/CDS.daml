@@ -61,6 +61,10 @@ data LifecycleEvent
 -- Proposer is always the protection buyer, counterparty always the
 -- protection seller -- same simplification IRS makes (proposer always
 -- becomes fixedRatePayer): no separate role-selection flag needed.
+-- AcceptTrade/RejectTrade are inherited from Lifecycle.daml's
+-- IProposable -- see IRS.daml's TradeProposal for the full reasoning
+-- (no cash account to name explicitly, account existence deliberately
+-- not validated here).
 template TradeProposal
   with
     proposer           : Party
@@ -81,14 +85,10 @@ template TradeProposal
         && maturityDate > effectiveDate
         && premiumLeg.rate >= 0.0 && premiumLeg.rate <= 1.0
 
-    -- No cash account to name explicitly -- see IRS.daml's AcceptTrade for
-    -- the full reasoning, including why account existence is deliberately
-    -- NOT validated here (counterparty, this choice's submitter, has no
-    -- visibility into proposer's account).
-    choice AcceptTrade : ContractId CDSTrade
-      controller counterparty
-      do
-        create CDSTrade with
+    interface instance IProposable for TradeProposal where
+      view = VProposable with proposer; counterparty
+      toLiveTrade =
+        toInterface @INovatable $ CDSTrade with
           protectionBuyer = proposer
           protectionSeller = counterparty
           oracle
@@ -103,10 +103,6 @@ template TradeProposal
           postedMarginByProtectionBuyer = 0.0
           postedMarginByProtectionSeller = 0.0
           history = []
-
-    choice RejectTrade : ()
-      controller counterparty
-      do pure ()
 
 
 -- ============================================================

@@ -45,7 +45,8 @@ setupTrade buyerAmt sellerAmt = do
       effectiveDate = date 2026 Jul 20
       maturityDate = date 2031 Jul 20
 
-  tradeCid <- submit bob do exerciseCmd proposalCid AcceptTrade
+  tradeCid <- fromInterfaceContractId @CDSTrade <$> submit bob do
+    exerciseCmd (toInterfaceContractId @IProposable proposalCid) AcceptTrade
   pure Fixture with alice; bob; oracle; bank; tradeCid
 
 -- Helper: total balance a party can see across their CashHoldings.
@@ -75,7 +76,7 @@ testRejectTradeDeclinesProposal = do
       effectiveDate = date 2026 Jul 20
       maturityDate = date 2031 Jul 20
 
-  submit bob do exerciseCmd proposalCid RejectTrade
+  submit bob do exerciseCmd (toInterfaceContractId @IProposable proposalCid) RejectTrade
 
   trades <- query @CDSTrade alice
   assertMsg "no trade created after rejection" (null trades)

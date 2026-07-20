@@ -1,20 +1,61 @@
 module Lifecycle where
 
--- Interfaces hosting the GENERIC, once-written novation/termination choice
--- logic (guards, authorization shape, the multi-step consent flow) shared
--- across every product (IRS, CDS). Each concrete trade type implements a
--- small number of per-product hooks that touch its own real fields.
--- Modeled directly on the Daml SDK's own daml-intro-13 tutorial
--- (IAsset/Cash/NFT, bundled with this project's pinned SDK 2.10.4): a
--- shared transfer-proposal lifecycle across heterogeneous templates.
+-- Interfaces hosting the GENERIC, once-written trade-origination,
+-- novation, and termination choice logic (guards, authorization shape,
+-- the multi-step consent flow) shared across every product (IRS, CDS).
+-- Each concrete trade type implements a small number of per-product
+-- hooks that touch its own real fields. Modeled directly on the Daml
+-- SDK's own daml-intro-13 tutorial (IAsset/Cash/NFT, bundled with this
+-- project's pinned SDK 2.10.4): a shared transfer-proposal lifecycle
+-- across heterogeneous templates.
 --
--- Proposal/confirmation templates embed the full underlying trade as a
--- plain VALUE (a field, not a contract-id reference) -- so there's no
--- staleness/race risk, and declining is just recreating that embedded
--- value. See ARCHITECTURE.md, "Propose-accept: carrying authority across
--- transactions", for why a signatory carried forward on an embedded value
--- lets a later single-party choice act with everyone's authority already
--- present.
+-- Novation/termination's proposal/confirmation templates embed the full
+-- underlying trade as a plain VALUE (a field, not a contract-id
+-- reference) -- so there's no staleness/race risk, and declining is just
+-- recreating that embedded value. See ARCHITECTURE.md, "Propose-accept:
+-- carrying authority across transactions", for why a signatory carried
+-- forward on an embedded value lets a later single-party choice act with
+-- everyone's authority already present. Trade origination (IProposable,
+-- below) doesn't need that trick at all -- there's no prior trade to
+-- carry forward, just a per-product hook building the first one.
+
+-- ============================================================
+-- Trade origination: propose -> accept/reject
+-- ============================================================
+
+data VProposable = VProposable with
+    proposer     : Party
+    counterparty : Party
+  deriving (Eq, Show)
+
+interface IProposable where
+  viewtype VProposable
+
+  -- Per-product hook: build MY OWN concrete live trade from this
+  -- proposal's fields. `proposer`/`counterparty` map onto whatever this
+  -- product calls its two roles (fixedRatePayer/floatingRatePayer,
+  -- protectionBuyer/protectionSeller, ...) -- this is the only place
+  -- that ever touches product-specific fields for trade origination.
+  -- Returned as INovatable since every live trade template already
+  -- implements it (see below); callers that need the concrete type
+  -- convert back with fromInterfaceContractId, same as every other
+  -- trade-returning choice in this module.
+  toLiveTrade : INovatable
+
+  -- Generic, written ONCE. counterparty's authority alone suffices to
+  -- trigger this because it's exercised ON the proposal, whose signatory
+  -- (proposer alone) plus this choice's own controller (counterparty)
+  -- together already carry exactly the two signatories the live trade
+  -- needs -- see ARCHITECTURE.md, "Propose-accept: carrying authority
+  -- across transactions".
+  choice AcceptTrade : ContractId INovatable
+    controller (view this).counterparty
+    do create (toLiveTrade this)
+
+  choice RejectTrade : ()
+    controller (view this).counterparty
+    do pure ()
+
 
 -- ============================================================
 -- Novation: propose -> accept/reject -> confirm/decline (tri-party)

@@ -71,22 +71,26 @@ two copies of the same logic — see "Modules" below and
   needed, the same as a real bank transfer. `tryMoveCash` is just one
   `Transfer` call (payer → receiver) exercised as a nested action inside
   a settlement choice.
-- **`Lifecycle.daml`** — Daml **interfaces** hosting the novation and
-  termination lifecycle, written once and shared by both `IRSTrade` and
-  `CDSTrade`: `INovatable`/`INovationProposal`/`INovationConfirmation` and
-  `ITerminable`/`ITerminationProposal`. Modeled directly on the Daml SDK's
-  own `daml-intro-13` tutorial (`IAsset`/`Cash`/`NFT`) — see
-  [ARCHITECTURE.md](ARCHITECTURE.md), "Shared lifecycle via interfaces",
-  for the full design and why it's safe.
+- **`Lifecycle.daml`** — Daml **interfaces** hosting trade origination,
+  novation, and termination, written once and shared by both `IRSTrade`
+  and `CDSTrade`: `IProposable`, `INovatable`/`INovationProposal`/
+  `INovationConfirmation`, and `ITerminable`/`ITerminationProposal`.
+  Modeled directly on the Daml SDK's own `daml-intro-13` tutorial
+  (`IAsset`/`Cash`/`NFT`) — see [ARCHITECTURE.md](ARCHITECTURE.md),
+  "Shared lifecycle via interfaces", for the full design and why it's
+  safe. `IProposable` is the simplest of the three: one per-product hook
+  (`toLiveTrade`) builds the first live trade, and `RejectTrade`'s body
+  is identical across products (`pure ()`) — nothing product-specific in
+  it at all.
 - **`IRS.daml`** — the IRS-specific contract:
-  - `TradeProposal` / `AcceptTrade` / `RejectTrade` — propose-accept
-    execution; the proposal names the `cashIssuer` (custodian) and
-    `settlementCurrency` both parties will settle through — not a
-    specific account, which is resolved by key at every settlement (see
-    Cash.daml's `CashAccountKey`).
+  - `TradeProposal` — propose-accept execution; `AcceptTrade`/
+    `RejectTrade` are inherited from `Lifecycle.daml`'s `IProposable`,
+    not hand-written here. The proposal names the `cashIssuer`
+    (custodian) and `settlementCurrency` both parties will settle
+    through — not a specific account, which is resolved by key at every
+    settlement (see Cash.daml's `CashAccountKey`).
   - `IRSTrade` — the live, dual-signatory contract. Implements
-    `INovatable`/`ITerminable` (novation/termination are inherited, not
-    hand-written here).
+    `INovatable`/`ITerminable` (novation/termination are inherited too).
   - `SettleCashflow` — oracle submits a `periodEnd` and the floating
     fixing; the contract computes the real day-count fraction
     (`Types.daml`'s `dayCountFraction`, from the trade's own tracked
@@ -107,9 +111,10 @@ two copies of the same logic — see "Modules" below and
     can't cover what's owed; the trade is archived with no successor, so
     no further lifecycle choices are structurally possible.
 - **`CDS.daml`** — the CDS-specific contract, same shape as `IRS.daml`:
-  - `TradeProposal` / `AcceptTrade` / `RejectTrade` — same propose-accept
-    shape (same `cashIssuer`/`settlementCurrency` naming, no account to
-    pin); the proposer is always the protection buyer.
+  - `TradeProposal` — same propose-accept shape (same `cashIssuer`/
+    `settlementCurrency` naming, no account to pin; `AcceptTrade`/
+    `RejectTrade` inherited from `IProposable`, same as IRS's); the
+    proposer is always the protection buyer.
   - `CDSTrade` — the live, dual-signatory contract. Implements
     `INovatable`/`ITerminable` identically to `IRSTrade`.
   - `SettlePremium` — oracle submits a `periodEnd`; the contract computes
@@ -136,13 +141,18 @@ two copies of the same logic — see "Modules" below and
     `CDS.daml` itself, not `Types.daml` — see
     [ARCHITECTURE.md](ARCHITECTURE.md), "Qualified imports", for why.
 - **`Setup.daml`** — the init-script (wired via `daml.yaml`'s
-  `init-script`, runs automatically on every `daml start`). Allocates
-  Alice, Bob, Charlie, Bank, Oracle; registers them as Navigator/JSON API
-  users; funds **one** `CashHolding` per party (Alice, Bob, Charlie — see
-  "What `CashHolding` maps to" below for why one account safely serves
-  both seeded trades, and any number more); and strikes **both** a live
-  `IRSTrade` and a live `CDSTrade` between Alice and Bob via the real
-  propose-accept flow, both settling through the same Bank/USD.
+  `init-script`, runs automatically on every `daml start`). Staged into
+  separate functions rather than one long script: `setupUsersAndAccounts`
+  allocates Alice, Bob, Charlie, Bank, Oracle, registers them as
+  Navigator/JSON API users, and funds **one** `CashHolding` per party
+  (Alice, Bob, Charlie — see "What `CashHolding` maps to" below for why
+  one account safely serves both seeded trades, and any number more);
+  `proposeIrsTrade`/`proposeCdsTrade` each create a `TradeProposal`;
+  `acceptIrsTrade`/`acceptCdsTrade` each exercise `AcceptTrade` to make
+  it live. `setup` calls all of these in order — **comment out either
+  `acceptXxxTrade` call to demo `AcceptTrade` yourself** from Navigator
+  instead of having it already done: the corresponding `TradeProposal`
+  is left sitting there, live, for Bob to open and accept.
 - **`IRSTest.daml`** — IRS's Daml Script tests (31 tests): direct,
   ledger-free unit tests of `dayCountFraction`, plus full lifecycle tests
   covering every explicit choice at least once. Unchanged by the
@@ -353,7 +363,7 @@ From the project root:
 
 ```sh
 daml build              # compile the eight modules to a DAR
-daml test               # run both products' Daml Script lifecycle tests (48 total)
+daml test               # run both products' Daml Script lifecycle tests (49 total)
 daml start              # sandbox + JSON API (7575) + Navigator (7500),
                         # runs Setup automatically
 ```

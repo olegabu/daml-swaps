@@ -3,21 +3,48 @@ module Setup where
 import DA.Date (Month(Jul), date)
 import Daml.Script
 import Cash
+import Lifecycle
 import qualified IRS
 import qualified CDS
 import Types
 
--- Runs automatically on every `daml start` (wired via daml.yaml's
--- `init-script`), before Navigator/JSON API come up, so Alice, Bob,
--- Charlie and the Bank always exist on a fresh sandbox instead of
--- requiring manual allocation.
---
 -- IRS and CDS are qualified imports -- both modules define
 -- TradeProposal/AcceptTrade/NovationProposal/SettlementFailure etc. under
 -- the same names (see ARCHITECTURE.md, "Qualified imports: two products,
 -- one vocabulary"), so every reference below is IRS.Foo or CDS.Foo.
+data Parties = Parties with
+    alice   : Party
+    bob     : Party
+    charlie : Party
+    bank    : Party
+    oracle  : Party
+
+-- Runs automatically on every `daml start` (wired via daml.yaml's
+-- `init-script`), before Navigator/JSON API come up, so both trades are
+-- already live the moment Navigator opens. Split into stages -- users,
+-- proposals, acceptances -- so the acceptance step can be commented out
+-- below to demo it manually from Navigator instead (see the comment at
+-- the bottom of this function).
 setup : Script ()
 setup = do
+  parties <- setupUsersAndAccounts
+
+  irsProposalCid <- proposeIrsTrade parties
+  cdsProposalCid <- proposeCdsTrade parties
+
+  -- Comment out either (or both) of these two lines to demo AcceptTrade
+  -- manually from Navigator instead of having it already done: the
+  -- corresponding TradeProposal will be sitting there, live, waiting for
+  -- Bob to open it and exercise AcceptTrade himself.
+  -- acceptIrsTrade parties irsProposalCid
+  -- acceptCdsTrade parties cdsProposalCid
+
+  pure ()
+
+-- Allocates Alice, Bob, Charlie, Bank, Oracle; registers a Navigator/JSON
+-- API user for each; and funds one CashHolding per party.
+setupUsersAndAccounts : Script Parties
+setupUsersAndAccounts = do
   alice <- allocatePartyWithHint "Alice" (PartyIdHint "Alice")
   bob <- allocatePartyWithHint "Bob" (PartyIdHint "Bob")
   charlie <- allocatePartyWithHint "Charlie" (PartyIdHint "Charlie")
@@ -56,15 +83,30 @@ setup = do
   -- walkthrough uses the IRS trade only; see README.md).
   _ <- fundAccount bank charlie oracle "Charlie-USD" 1000000.0
 
-  -- Seed a live IRSTrade via the real propose-accept flow (not a
-  -- multi-party submit) so the demo exercises the same authorization
-  -- path a real counterparty negotiation would use.
-  irsProposalCid <- submit alice do
+  pure Parties with alice; bob; charlie; bank; oracle
+
+fundAccount : Party -> Party -> Party -> Text -> Decimal -> Script (ContractId CashHolding)
+fundAccount bank owner oracle label amount =
+  submit bank do
+    createCmd CashHolding with
+      issuer = bank
+      owner
+      label
+      currency = USD
+      amount
+      observers = [oracle]
+
+-- Proposes a live IRSTrade via the real propose-accept flow (not a
+-- multi-party submit) so the demo exercises the same authorization path
+-- a real counterparty negotiation would use.
+proposeIrsTrade : Parties -> Script (ContractId IRS.TradeProposal)
+proposeIrsTrade parties =
+  submit parties.alice do
     createCmd IRS.TradeProposal with
-      proposer = alice
-      counterparty = bob
-      oracle
-      cashIssuer = bank
+      proposer = parties.alice
+      counterparty = parties.bob
+      oracle = parties.oracle
+      cashIssuer = parties.bank
       settlementCurrency = USD
       notional = 10000000.0
       fixedLeg = FixedLeg with
@@ -79,17 +121,23 @@ setup = do
       effectiveDate = date 2026 Jul 20
       maturityDate = date 2027 Jul 20
 
-  _ <- submit bob do
-    exerciseCmd irsProposalCid IRS.AcceptTrade
+-- Bob accepts, making the IRSTrade live.
+acceptIrsTrade : Parties -> ContractId IRS.TradeProposal -> Script ()
+acceptIrsTrade parties proposalCid = do
+  _ <- submit parties.bob do
+    exerciseCmd (toInterfaceContractId @IProposable proposalCid) AcceptTrade
+  pure ()
 
-  -- Seed a live CDSTrade the same way: Alice buys protection on a
-  -- reference entity from Bob, paying a 100bps running premium quarterly.
-  cdsProposalCid <- submit alice do
+-- Proposes a live CDSTrade the same way: Alice buys protection on a
+-- reference entity from Bob, paying a 100bps running premium quarterly.
+proposeCdsTrade : Parties -> Script (ContractId CDS.TradeProposal)
+proposeCdsTrade parties =
+  submit parties.alice do
     createCmd CDS.TradeProposal with
-      proposer = alice
-      counterparty = bob
-      oracle
-      cashIssuer = bank
+      proposer = parties.alice
+      counterparty = parties.bob
+      oracle = parties.oracle
+      cashIssuer = parties.bank
       settlementCurrency = USD
       notional = 10000000.0
       referenceEntity = "Acme Corp"
@@ -100,18 +148,9 @@ setup = do
       effectiveDate = date 2026 Jul 20
       maturityDate = date 2031 Jul 20
 
-  _ <- submit bob do
-    exerciseCmd cdsProposalCid CDS.AcceptTrade
-
+-- Bob accepts, making the CDSTrade live.
+acceptCdsTrade : Parties -> ContractId CDS.TradeProposal -> Script ()
+acceptCdsTrade parties proposalCid = do
+  _ <- submit parties.bob do
+    exerciseCmd (toInterfaceContractId @IProposable proposalCid) AcceptTrade
   pure ()
-
-fundAccount : Party -> Party -> Party -> Text -> Decimal -> Script (ContractId CashHolding)
-fundAccount bank owner oracle label amount =
-  submit bank do
-    createCmd CashHolding with
-      issuer = bank
-      owner
-      label
-      currency = USD
-      amount
-      observers = [oracle]

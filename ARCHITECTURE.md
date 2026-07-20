@@ -37,18 +37,24 @@ and to Canton generally), then what's specific to **IRS** and **CDS**.
 
 ### Shared lifecycle via interfaces
 
-IRS and CDS are two economically different products, but their novation
-and termination mechanics — propose → accept/reject, then (for novation)
-confirm/decline by a third party — are *structurally identical*: same
-guards, same authority-carrying trick, same shape of "embed the original,
-recreate it verbatim on a decline." Rather than writing that logic twice
-under name-compatible-but-separate templates, `Lifecycle.daml` hosts it
-**once**, as two Daml interfaces (`INovatable`/`ITerminable` and their
-proposal/confirmation counterparts), and `IRSTrade`/`CDSTrade` each
-implement a handful of small per-product hooks.
+IRS and CDS are two economically different products, but their trade
+origination, novation, and termination mechanics — propose →
+accept/reject, then (for novation) confirm/decline by a third party —
+are *structurally identical*: same guards, same authority-carrying
+trick. Rather than writing that logic twice under
+name-compatible-but-separate templates, `Lifecycle.daml` hosts it
+**once**, as three Daml interfaces (`IProposable`, `INovatable`/
+`ITerminable` and their proposal/confirmation counterparts), and
+`IRSTrade`/`CDSTrade` each implement a handful of small per-product
+hooks. `IProposable` is the simplest of the three — just one per-product
+hook (`toLiveTrade`) and a `RejectTrade` choice whose body
+(`controller (view this).counterparty; do pure ()`) is *identical* down
+to the byte across products, not just structurally similar; `INovatable`/
+`ITerminable` additionally share the "embed the original, recreate it
+verbatim on a decline" shape described next.
 
 This is modeled directly on the Daml SDK's own `daml-intro-13` tutorial
-(`IAsset`/`Cash`/`NFT`, bundled with this project's pinned SDK 2.10.4),
+(`IAsset`/`Cash`/`NFT`),
 which solves the structurally identical problem — a shared
 transfer-proposal lifecycle across two heterogeneous asset templates —
 the same way: the interface hosts the generic choice bodies; each
@@ -57,15 +63,24 @@ that touch its own real fields; the interface's choices are called with
 `this` as an explicit first argument (`toTransferProposal this newOwner`,
 not an implicit method-call syntax).
 
-The proposal/confirmation templates **embed the full underlying trade as
-a plain value field** (`orig : IRSTrade`, matching the tutorial's `cash :
-Cash`) — not a contract-id reference — so there's no staleness/race risk,
-and declining is just `create (trade this)` (recreating that embedded
-value verbatim, fresh contract id), no field-by-field reconstruction.
+`INovatable`/`ITerminable`'s proposal/confirmation templates **embed the
+full underlying trade as a plain value field** (`orig : IRSTrade`,
+matching the tutorial's `cash : Cash`) — not a contract-id reference —
+so there's no staleness/race risk, and declining is just `create (trade
+this)` (recreating that embedded value verbatim, fresh contract id), no
+field-by-field reconstruction. `IProposable`'s `TradeProposal` has
+nothing to embed this way — there's no prior live trade yet, just its
+own product-specific economic terms (`fixedLeg`/`floatingLeg` vs.
+`premiumLeg`/`referenceEntity`) sitting directly on the template, same
+as before — `toLiveTrade` builds the *first* live trade from those
+fields plus `proposer`/`counterparty`, rather than reconstructing an
+existing one.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Trade: IRSTrade / CDSTrade
+    [*] --> TradeProposal: create (proposer)
+    TradeProposal --> Trade: AcceptTrade (counterparty)
+    TradeProposal --> [*]: RejectTrade (counterparty)
 
     Trade --> NovationProposal: ProposeNovation (transferor)
     NovationProposal --> NovationConfirmation: AcceptNovation (transferee)
@@ -76,8 +91,6 @@ stateDiagram-v2
     Trade --> TerminationProposal: ProposeTermination (proposer)
     TerminationProposal --> [*]: AcceptTermination (otherParty)
     TerminationProposal --> Trade: RejectTermination (otherParty)
-
-    Trade': [*]
 ```
 
 **Why one interface method name can't be reused across two interfaces in
@@ -112,6 +125,23 @@ is the opposite direction: code that wants the concrete trade's own
 fields back (e.g. a test asserting on `trade.fixedRatePayer`) calls
 `fromInterfaceContractId @IRSTrade` on the final `ContractId INovatable`
 the flow hands back.
+
+`IProposable` follows the identical pattern one level earlier in the
+lifecycle: `AcceptTrade`/`RejectTrade` are declared on `IProposable`, not
+on `TradeProposal` directly, so the very first exercise on a freshly
+created proposal also needs `toInterfaceContractId @IProposable`:
+
+```haskell
+exerciseCmd (toInterfaceContractId @IProposable proposalCid) AcceptTrade
+```
+
+— and because `AcceptTrade`'s return type is `ContractId INovatable`
+(not the concrete `IRSTrade`/`CDSTrade`), callers that need the concrete
+trade back (to exercise `SettleCashflow`/`SettlePremium`/etc., which
+*aren't* interface choices) convert once more with
+`fromInterfaceContractId`, same as above — see `Setup.daml` and
+`IRSTest.daml`/`CDSTest.daml`'s `setupTrade` for both conversions
+chained back to back.
 
 ### Authority vs. visibility (two separate things)
 
@@ -374,14 +404,17 @@ instances of this pattern in this codebase, all now implemented through
 per product:
 
 - **Trade execution** — `TradeProposal` (signatory = `proposer` alone) /
-  `AcceptTrade` (controller = `counterparty`), duplicated per product
-  since there's no existing trade to embed yet at proposal time (see
-  "Qualified imports" below for why duplication here, specifically, is
-  fine). Accepting creates the live trade signed by both parties;
-  available authority at that point = `{proposer}` (from the proposal's
-  signatory) ∪ `{counterparty}` (the accept choice's controller) = exactly
-  the two signatories needed. Neither party ever needed to `actAs` the
-  other.
+  `AcceptTrade` (an `IProposable` interface choice, controller =
+  `counterparty`). Accepting creates the live trade signed by both
+  parties; available authority at that point = `{proposer}` (from the
+  proposal's signatory) ∪ `{counterparty}` (the accept choice's
+  controller) = exactly the two signatories needed. Neither party ever
+  needed to `actAs` the other. Each product's `TradeProposal` template
+  still carries its own economic terms (there's nothing to share there —
+  `fixedLeg`/`floatingLeg` and `premiumLeg`/`referenceEntity` are
+  genuinely different shapes), but the *choice logic* — `AcceptTrade`,
+  `RejectTrade` — is shared, same as novation/termination below; see
+  "Shared lifecycle via interfaces" above.
 
 - **Novation — tri-party, chained twice.** Real ISDA novations need three
   consents, not two: the **transferor** (stepping out), the **transferee**
@@ -459,13 +492,16 @@ interfaces for novation/termination) is the available pattern.
 
 ### Qualified imports: two products, one vocabulary
 
-`IRS.daml` and `CDS.daml` both define `TradeProposal`, `AcceptTrade`,
-`RejectTrade`, `NovationProposal`, `NovationConfirmation`,
-`TerminationProposal`, and `SettlementFailure` — same names, deliberately,
-because they play the same role in each product's lifecycle and there's
-no value in inventing product-prefixed names for structurally identical
-concepts. Any module that needs both (`Setup.daml`, and any future
-cross-product client code) imports them **qualified**:
+`IRS.daml` and `CDS.daml` both define `TradeProposal`, `NovationProposal`,
+`NovationConfirmation`, `TerminationProposal`, and `SettlementFailure` —
+same names, deliberately, because they play the same role in each
+product's lifecycle and there's no value in inventing product-prefixed
+names for structurally identical concepts. (`AcceptTrade`/`RejectTrade`/
+`ProposeNovation`/etc. themselves aren't independently defined in either
+file any more — they're inherited from `Lifecycle.daml`'s interfaces, see
+above — so there's nothing to qualify for those specifically.) Any module
+that needs both templates (`Setup.daml`, and any future cross-product
+client code) imports them **qualified**:
 
 ```haskell
 import qualified IRS
@@ -482,14 +518,28 @@ qualified importing elsewhere can't help with, which is why
 `ITerminationProposal.terminatingTrade` had to be named distinctly from
 `INovationProposal.trade` inside `Lifecycle.daml` itself.
 
-`TradeProposal`/`SettlementFailure` stay duplicated per product rather
-than unified through an interface, unlike novation/termination: there's
-no existing trade to embed at proposal time (so the embedded-value
-trick doesn't apply), and `SettlementFailure.history` is genuinely
-differently-typed per product (IRS's `CashflowEvent`/`MarginEvent` vs.
-CDS's `PremiumEvent`/`MarginEvent`/`CreditEventEntry`) — unifying it would
+`TradeProposal`'s *template* — its own product-specific economic
+terms — stays duplicated per product, same as `IRSTrade`/`CDSTrade`
+themselves do; there's no shared shape to give `fixedLeg`/`floatingLeg`
+and `premiumLeg`/`referenceEntity` beyond what `Types.daml` already
+reuses (`FixedLeg`). Its *choice logic* (`AcceptTrade`/`RejectTrade`) is
+unified through `IProposable`, exactly like novation/termination —
+earlier notes in this file claimed otherwise ("no existing trade to
+embed at proposal time, so the embedded-value trick doesn't apply"),
+which is true but was the wrong reason to stop at: that trick is only
+needed to reconstruct an *existing* trade on a decline (novation/
+termination's job), and origination never needs to reconstruct
+anything — it just needs a per-product hook that builds the *first*
+live trade, which `toLiveTrade` is.
+
+`SettlementFailure` is the one template that genuinely doesn't unify:
+its `history` field is differently-typed per product (IRS's
+`CashflowEvent`/`MarginEvent` vs. CDS's
+`PremiumEvent`/`MarginEvent`/`CreditEventEntry`), so there's no single
+interface method signature that could return it — unifying it would
 need the embedded-value trick applied to a type that doesn't have one
-natural underlying "trade" to embed.
+natural underlying "trade" to embed, the same gap that's real for
+novation/termination's confirmation stage but not for origination.
 
 ### Oracle / calculation-agent pattern
 

@@ -8,6 +8,21 @@ import Lifecycle
 -- Trade execution: propose -> accept
 -- ============================================================
 
+-- AcceptTrade/RejectTrade are inherited from Lifecycle.daml's
+-- IProposable -- see the interface instance below for the only
+-- product-specific piece (toLiveTrade). Both parties settle through the
+-- SAME (cashIssuer, settlementCurrency) named below -- there's no cash
+-- account to name explicitly (see Cash.daml's CashAccountKey): each
+-- party's account is resolved by (cashIssuer, thatParty,
+-- settlementCurrency) fresh at every settlement, rather than pinning a
+-- specific contract id that would go stale the moment any OTHER trade
+-- against the same account settles first (see README.md, "What
+-- CashHolding maps to"). Deliberately NOT validated that either account
+-- actually exists yet: AcceptTrade is submitted by counterparty alone,
+-- who has no visibility into proposer's account (only the oracle is a
+-- declared observer on every account -- see Cash.daml); a missing
+-- account instead surfaces naturally at the first real settlement, which
+-- the oracle submits and can see everything for.
 template TradeProposal
   with
     proposer          : Party
@@ -28,25 +43,10 @@ template TradeProposal
         && maturityDate > effectiveDate
         && fixedLeg.rate >= 0.0 && fixedLeg.rate <= 1.0   -- decimal fraction
 
-    -- Counterparty accepts. Both parties settle through the SAME
-    -- (cashIssuer, settlementCurrency) named above -- there's no cash
-    -- account to name explicitly any more (see Cash.daml's
-    -- CashAccountKey): each party's account is resolved by
-    -- (cashIssuer, thatParty, settlementCurrency) fresh at every
-    -- settlement, rather than pinning a specific contract id that would go
-    -- stale the moment any OTHER trade against the same account settles
-    -- first (see README.md, "What CashHolding maps to"). Deliberately NOT
-    -- validated here that either account actually exists yet: this choice
-    -- is submitted by counterparty alone, who has no visibility into
-    -- proposer's account (only the oracle is a declared observer on every
-    -- account -- see Cash.daml). A fetchByKey here would need proposer's
-    -- account visible to counterparty specifically, which it isn't; a
-    -- missing account instead surfaces naturally at the first real
-    -- settlement, which the oracle submits and can see everything for.
-    choice AcceptTrade : ContractId IRSTrade
-      controller counterparty
-      do
-        create IRSTrade with
+    interface instance IProposable for TradeProposal where
+      view = VProposable with proposer; counterparty
+      toLiveTrade =
+        toInterface @INovatable $ IRSTrade with
           fixedRatePayer = proposer
           floatingRatePayer = counterparty
           oracle
@@ -61,10 +61,6 @@ template TradeProposal
           postedMarginByFixedRatePayer = 0.0
           postedMarginByFloatingRatePayer = 0.0
           history = []
-
-    choice RejectTrade : ()
-      controller counterparty
-      do pure ()
 
 
 -- ============================================================
