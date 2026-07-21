@@ -1,0 +1,549 @@
+module TRSTest where
+
+import DA.Date (Month(Jul, Aug), date)
+import Daml.Script
+import Cash
+import TRS
+import Lifecycle
+import Types (Currency(..), DayCountConvention(..), Frequency(..), ReferenceRate(..), FloatingLeg(..))
+
+-- Shared fixture: allocate parties, fund both accounts with `receiverAmt` /
+-- `payerAmt`, strike the trade, return everything the tests need. Mirrors
+-- CDSTest.daml's setupTrade -- see there for the sibling product.
+--
+-- Index "SPX-TR" at 16650.0 (a round approximation of the real level --
+-- see README.md's demo Part 3 note), notional 10M, funding SOFR + 0bps
+-- spread, Act360 (so daily accrual is exact: 1 day = 1/360, rate 0.036
+-- -> a clean 1,000/day on 10M).
+data Fixture = Fixture with
+  alice  : Party   -- total return receiver
+  bob    : Party   -- total return payer
+  oracle : Party
+  bank   : Party   -- the trade's cashIssuer -- reuse this, not a fresh allocateParty "Bank"
+  tradeCid : ContractId TRSTrade
+
+setupTrade : Decimal -> Decimal -> Script Fixture
+setupTrade receiverAmt payerAmt = do
+  bank   <- allocateParty "Bank"
+  alice  <- allocateParty "Alice"
+  bob    <- allocateParty "Bob"
+  oracle <- allocateParty "Oracle"
+
+  _ <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = alice; label = "Alice-USD"; currency = USD; amount = receiverAmt; observers = [oracle]
+  _ <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = bob; label = "Bob-USD"; currency = USD; amount = payerAmt; observers = [oracle]
+
+  proposalCid <- submit alice do
+    createCmd TradeProposal with
+      proposer = alice
+      counterparty = bob
+      oracle
+      cashIssuer = bank
+      settlementCurrency = USD
+      notional = 10000000.0
+      indexName = "SPX-TR"
+      initialIndexLevel = 16650.0
+      financingLeg = FloatingLeg with
+        floatingIndex = SOFR; spread = 0.0; dayCount = Act360; frequency = Quarterly
+      effectiveDate = date 2026 Jul 20
+      maturityDate = date 2027 Jul 20
+
+  tradeCid <- fromInterfaceContractId @TRSTrade <$> submit bob do
+    exerciseCmd (toInterfaceContractId @IProposable proposalCid) AcceptTrade
+  pure Fixture with alice; bob; oracle; bank; tradeCid
+
+-- Helper: total balance a party can see across their CashHoldings.
+balanceOf : Party -> Script Decimal
+balanceOf p = do
+  holdings <- query @CashHolding p
+  pure $ sum [c.amount | (_, c) <- holdings, c.owner == p]
+
+-- Counterparty can decline the initial trade proposal. No TRSTrade should
+-- ever come into existence.
+testRejectTradeDeclinesProposal : Script ()
+testRejectTradeDeclinesProposal = do
+  bank   <- allocateParty "Bank"
+  alice  <- allocateParty "Alice"
+  bob    <- allocateParty "Bob"
+  oracle <- allocateParty "Oracle"
+  _ <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = alice; label = "Alice-USD"; currency = USD; amount = 1000000.0; observers = [oracle]
+
+  proposalCid <- submit alice do
+    createCmd TradeProposal with
+      proposer = alice; counterparty = bob; oracle
+      cashIssuer = bank; settlementCurrency = USD
+      notional = 10000000.0
+      indexName = "SPX-TR"
+      initialIndexLevel = 16650.0
+      financingLeg = FloatingLeg with
+        floatingIndex = SOFR; spread = 0.0; dayCount = Act360; frequency = Quarterly
+      effectiveDate = date 2026 Jul 20
+      maturityDate = date 2027 Jul 20
+
+  submit bob do exerciseCmd (toInterfaceContractId @IProposable proposalCid) RejectTrade
+
+  trades <- query @TRSTrade alice
+  assertMsg "no trade created after rejection" (null trades)
+
+-- Daily VM, index UP: +10% (16650 -> 18315) after a 9-day gap. Act360's
+-- day fraction only terminates cleanly in Decimal for multiples of 9
+-- days (9/360 = 0.025 exactly; 1/360 does not terminate at Numeric 10,
+-- see testFundingAccruesPerElapsedDays' note), so every dated test below
+-- uses 9-day steps to keep pinned numbers exact. (The dollar amounts
+-- below are pure ratios of notional -- they're identical regardless of
+-- the index's absolute level, only the *percentage* move matters.)
+-- dailyPerf = 0.10 * 10M = 1,000,000; funding = 0.036 * 10M * 9/360 = 9,000.
+-- net = 991,000 -- payer (Bob) pays receiver (Alice).
+testSettleMarginUpMovesCash : Script ()
+testSettleMarginUpMovesCash = do
+  f <- setupTrade 1000000.0 1000000.0
+  res <- submit f.oracle do
+    exerciseCmd f.tradeCid SettleMargin with
+      asOf = date 2026 Jul 29; indexLevel = 18315.0; observedRate = 0.036
+  case res of
+    Left _ -> abort "expected trade to continue, got default"
+    Right _ -> pure ()
+  aliceBal <- balanceOf f.alice
+  bobBal <- balanceOf f.bob
+  assertMsg "receiver (Alice) credited 991000" (aliceBal == 1991000.0)
+  assertMsg "payer (Bob) debited 991000" (bobBal == 9000.0)
+
+-- Daily VM, index DOWN: -2% (16650 -> 16317) after a 9-day gap.
+-- dailyPerf = -0.02 * 10M = -200,000; funding = 9,000.
+-- net = -209,000 -- receiver (Alice) pays payer (Bob).
+testSettleMarginDownMovesCash : Script ()
+testSettleMarginDownMovesCash = do
+  f <- setupTrade 1000000.0 1000000.0
+  Right newTradeCid <- submit f.oracle do
+    exerciseCmd f.tradeCid SettleMargin with
+      asOf = date 2026 Jul 29; indexLevel = 16317.0; observedRate = 0.036
+  aliceBal <- balanceOf f.alice
+  bobBal <- balanceOf f.bob
+  assertMsg "receiver (Alice) debited 209000" (aliceBal == 791000.0)
+  assertMsg "payer (Bob) credited 209000" (bobBal == 1209000.0)
+
+  Some trade <- queryContractId f.alice newTradeCid
+  case trade.history of
+    [SettlementEvent r] -> do
+      assertMsg "kind is DailyVM" (r.kind == DailyVM)
+      assertMsg "perfAmount is -200000" (r.perfAmount == -200000.0)
+      assertMsg "fundingAmount is 9000" (r.fundingAmount == 9000.0)
+      assertMsg "Alice paid" (r.paidBy == f.alice)
+      assertMsg "Bob received" (r.paidTo == f.bob)
+    _ -> abort "expected exactly one SettlementEvent in history"
+
+-- Funding accrues per elapsed day, isolated from any index move: an
+-- 18-day gap (double the 9-day step used elsewhere in this file) with
+-- the index UNCHANGED owes exactly double the funding -- 18,000, not
+-- 9,000 (receiver pays). 9-day multiples are used throughout this file
+-- because Act360's day fraction (elapsedDays/360) only terminates
+-- cleanly in Decimal for multiples of 9 (9/360 = 0.025); a plain 1-day
+-- gap (1/360 = 0.00277...78, non-terminating at Numeric 10) leaves a
+-- ~0.000008 rounding remainder that would break exact-equality asserts.
+testFundingAccruesPerElapsedDays : Script ()
+testFundingAccruesPerElapsedDays = do
+  f <- setupTrade 1000000.0 1000000.0
+  res <- submit f.oracle do
+    exerciseCmd f.tradeCid SettleMargin with
+      asOf = date 2026 Aug 7; indexLevel = 16650.0; observedRate = 0.036
+  case res of
+    Left _ -> abort "expected trade to continue, got default"
+    Right _ -> pure ()
+  aliceBal <- balanceOf f.alice
+  bobBal <- balanceOf f.bob
+  assertMsg "receiver (Alice) debited 18000 in pure funding" (aliceBal == 982000.0)
+  assertMsg "payer (Bob) credited 18000" (bobBal == 1018000.0)
+
+-- The design's centerpiece: daily VM payments compound rather than
+-- telescope (prior-day-percentage convention), so their sum can diverge
+-- from the period's true return -- and the reset's residual corrects for
+-- exactly that gap, never double-paying.
+--
+-- Day 1 (+9d): 16650 -> 18315 (+10%). dailyPerf = 1,000,000; funding = 9,000;
+--   net = 991,000, Bob -> Alice. vmPaidSinceReset becomes 1,000,000.
+-- Day 2 (+9d more): 18315 -> 16483.5 (-10% of 18315 exactly). dailyPerf =
+--   -1,000,000; funding = 9,000; net = -1,009,000, Alice -> Bob.
+--   vmPaidSinceReset becomes 1,000,000 + (-1,000,000) = 0 -- the two
+--   equal-and-opposite PERCENTAGE moves compound to a small net loss in
+--   absolute terms, even though they cancel in vmPaidSinceReset.
+-- Reset (+9d more, same level 16483.5): cumulative vs. the ORIGINAL 16650
+--   anchor = (16483.5-16650)/16650*10M = -100,000 (index is actually down
+--   1% over the period). residual = -100,000 - 0 = -100,000; funding =
+--   9,000; net = -109,000, Alice -> Bob. Anchor re-bases to 16483.5.
+testCompoundingResidualTruedUpByReset : Script ()
+testCompoundingResidualTruedUpByReset = do
+  f <- setupTrade 2000000.0 2000000.0
+
+  Right afterDay1 <- submit f.oracle do
+    exerciseCmd f.tradeCid SettleMargin with
+      asOf = date 2026 Jul 29; indexLevel = 18315.0; observedRate = 0.036
+  aliceBalDay1 <- balanceOf f.alice
+  bobBalDay1 <- balanceOf f.bob
+  assertMsg "after day 1: Alice up 991000" (aliceBalDay1 == 2991000.0)
+  assertMsg "after day 1: Bob down 991000" (bobBalDay1 == 1009000.0)
+
+  Right afterDay2 <- submit f.oracle do
+    exerciseCmd afterDay1 SettleMargin with
+      asOf = date 2026 Aug 7; indexLevel = 16483.5; observedRate = 0.036
+  aliceBalDay2 <- balanceOf f.alice
+  bobBalDay2 <- balanceOf f.bob
+  assertMsg "after day 2: Alice down 1009000 from day-1 peak" (aliceBalDay2 == 1982000.0)
+  assertMsg "after day 2: Bob up 1009000 from day-1 trough" (bobBalDay2 == 2018000.0)
+
+  Some tradeAfterDay2 <- queryContractId f.alice afterDay2
+  assertMsg "vmPaidSinceReset nets to zero after the round trip"
+    (tradeAfterDay2.vmPaidSinceReset == 0.0)
+  assertMsg "reset anchor untouched by daily VM"
+    (tradeAfterDay2.lastResetIndexLevel == 16650.0)
+
+  Right afterReset <- submit f.oracle do
+    exerciseCmd afterDay2 SettleReset with
+      asOf = date 2026 Aug 16; indexLevel = 16483.5; observedRate = 0.036
+  aliceBalFinal <- balanceOf f.alice
+  bobBalFinal <- balanceOf f.bob
+  assertMsg "reset: Alice pays the 100000 residual + 9000 funding" (aliceBalFinal == 1873000.0)
+  assertMsg "reset: Bob receives 109000" (bobBalFinal == 2127000.0)
+
+  Some tradeAfterReset <- queryContractId f.alice afterReset
+  assertMsg "reset anchor re-based to 16483.5" (tradeAfterReset.lastResetIndexLevel == 16483.5)
+  assertMsg "vmPaidSinceReset zeroed" (tradeAfterReset.vmPaidSinceReset == 0.0)
+  case tradeAfterReset.history of
+    [_, _, SettlementEvent r] -> do
+      assertMsg "reset kind" (r.kind == Reset)
+      assertMsg "residual is -100000" (r.perfAmount == -100000.0)
+      assertMsg "Alice paid the reset" (r.paidBy == f.alice)
+    _ -> abort "expected three SettlementEvents in history"
+
+-- Post-reset, a daily VM measures against the NEW anchor: a +1% move
+-- right after a reset to 16816.5 pays the same 91,000 as the reset's own
+-- +1% move did against the OLD anchor -- proving the anchor genuinely
+-- moved, not just the number stored in it.
+testResetReAnchors : Script ()
+testResetReAnchors = do
+  f <- setupTrade 1000000.0 1000000.0
+
+  -- Reset immediately (+9d): cumulative = (16816.5-16650)/16650*10M =
+  -- 100,000; vmPaidSinceReset = 0 so far -> residual = 100,000;
+  -- funding = 9,000 (9-day gap) -> net = 91,000, Bob -> Alice.
+  Right afterReset <- submit f.oracle do
+    exerciseCmd f.tradeCid SettleReset with
+      asOf = date 2026 Jul 29; indexLevel = 16816.5; observedRate = 0.036
+  aliceBalAfterReset <- balanceOf f.alice
+  assertMsg "reset pays 91000" (aliceBalAfterReset == 1091000.0)
+
+  -- Daily VM 9 days later at 16984.665 = +1% of the NEW anchor 16816.5:
+  -- dailyPerf = (16984.665-16816.5)/16816.5*10M = 100,000; funding = 9,000
+  -- (9-day gap) -> net = 91,000 again -- the same amount as the reset's
+  -- own +1% move.
+  Right afterVM <- submit f.oracle do
+    exerciseCmd afterReset SettleMargin with
+      asOf = date 2026 Aug 7; indexLevel = 16984.665; observedRate = 0.036
+  aliceBalFinal <- balanceOf f.alice
+  assertMsg "post-reset +1% VM pays the same 91000 as the reset did"
+    (aliceBalFinal == 1182000.0)
+
+-- Zero-residual case: a VM followed by a reset AT THE SAME LEVEL has
+-- already paid the full cumulative move as daily VM, so the reset's
+-- performance residual is exactly zero -- only funding moves.
+testZeroResidualReset : Script ()
+testZeroResidualReset = do
+  f <- setupTrade 1000000.0 1000000.0
+
+  -- VM (+9d): +2% (16650 -> 16983). dailyPerf = 200,000; funding = 9,000;
+  -- net = 191,000, Bob -> Alice. vmPaidSinceReset = 200,000.
+  Right afterVM <- submit f.oracle do
+    exerciseCmd f.tradeCid SettleMargin with
+      asOf = date 2026 Jul 29; indexLevel = 16983.0; observedRate = 0.036
+
+  -- Reset (+9d more) at the SAME level 16983: cumulative =
+  -- (16983-16650)/16650*10M = 200,000; residual = 200,000 - 200,000 = 0;
+  -- funding = 9,000 (9-day gap); net = -9,000 -- Alice pays Bob just
+  -- the funding.
+  Right afterReset <- submit f.oracle do
+    exerciseCmd afterVM SettleReset with
+      asOf = date 2026 Aug 7; indexLevel = 16983.0; observedRate = 0.036
+
+  Some trade <- queryContractId f.alice afterReset
+  case trade.history of
+    [_, SettlementEvent r] -> do
+      assertMsg "reset residual is exactly zero" (r.perfAmount == 0.0)
+      assertMsg "reset still moved cash for funding" (r.netPayment == 9000.0)
+      assertMsg "Alice paid the pure funding" (r.paidBy == f.alice)
+    _ -> abort "expected two SettlementEvents in history"
+
+-- Corporate action rebase: the provider rebases the index scale
+-- (16650 -> 166.5, factor 0.01). No cash moves. A subsequent VM measuring
+-- a genuine +2% move against the REBASED anchor nets a clean 191,000 --
+-- not a phantom ~100% loss, because both anchors moved together.
+testCorporateActionRebaseNoPhantomLoss : Script ()
+testCorporateActionRebaseNoPhantomLoss = do
+  f <- setupTrade 1000000.0 1000000.0
+  aliceBalBefore <- balanceOf f.alice
+  bobBalBefore <- balanceOf f.bob
+
+  rebasedCid <- submit f.oracle do
+    exerciseCmd f.tradeCid AdjustForCorporateAction with
+      actionType = IndexReconstitution; asOf = date 2026 Jul 29; adjustmentFactor = 0.01
+
+  aliceBalAfterRebase <- balanceOf f.alice
+  bobBalAfterRebase <- balanceOf f.bob
+  assertMsg "no cash moves on a corporate action" (aliceBalAfterRebase == aliceBalBefore && bobBalAfterRebase == bobBalBefore)
+
+  Some rebased <- queryContractId f.alice rebasedCid
+  assertMsg "lastIndexLevel rebased to 166.5" (rebased.lastIndexLevel == 166.5)
+  assertMsg "lastResetIndexLevel rebased to 166.5" (rebased.lastResetIndexLevel == 166.5)
+  assertMsg "lastSettledDate untouched by a corporate action -- only VM/Reset move it"
+    (rebased.lastSettledDate == date 2026 Jul 20)
+
+  -- +2% of the rebased 166.5 is 169.83. dailyPerf =
+  -- (169.83-166.5)/166.5*10M = 200,000. Funding's day-count basis is
+  -- lastSettledDate, which the corporate action above did NOT advance --
+  -- so this still spans all the way back to effectiveDate (Jul 20), an
+  -- 18-day gap: funding = 18,000; net = 182,000, Bob -> Alice.
+  Right afterVM <- submit f.oracle do
+    exerciseCmd rebasedCid SettleMargin with
+      asOf = date 2026 Aug 7; indexLevel = 169.83; observedRate = 0.036
+  aliceBalFinal <- balanceOf f.alice
+  bobBalFinal <- balanceOf f.bob
+  assertMsg "receiver (Alice) credited 182000, not a phantom loss" (aliceBalFinal == 1182000.0)
+  assertMsg "payer (Bob) debited 182000" (bobBalFinal == 818000.0)
+
+-- A rebase mid-period (after some daily VM has already accrued) doesn't
+-- need vmPaidSinceReset touched -- it's already in currency, invariant
+-- under a pure unit rebase of the index scale. The reset's residual
+-- still comes out correct against the rebased anchor.
+testCorporateActionRebaseThenResetResidualCorrect : Script ()
+testCorporateActionRebaseThenResetResidualCorrect = do
+  f <- setupTrade 1000000.0 1000000.0
+
+  -- VM (+9d): +2% (16650 -> 16983). net = 191,000, Bob -> Alice.
+  -- vmPaidSinceReset = 200,000.
+  Right afterVM <- submit f.oracle do
+    exerciseCmd f.tradeCid SettleMargin with
+      asOf = date 2026 Jul 29; indexLevel = 16983.0; observedRate = 0.036
+
+  -- Rebase (+9d more) by 0.1: lastIndexLevel 16983 -> 1698.3,
+  -- lastResetIndexLevel 16650 -> 1665.0. vmPaidSinceReset stays 200,000
+  -- (currency, unaffected).
+  rebasedCid <- submit f.oracle do
+    exerciseCmd afterVM AdjustForCorporateAction with
+      actionType = IndexReconstitution; asOf = date 2026 Aug 7; adjustmentFactor = 0.1
+  Some rebased <- queryContractId f.alice rebasedCid
+  assertMsg "vmPaidSinceReset untouched by rebase" (rebased.vmPaidSinceReset == 200000.0)
+
+  -- Reset (+9d more) at 1731.6 (a further +4% move against the rebased
+  -- scale): cumulative = (1731.6-1665)/1665*10M = 400,000; residual =
+  -- 400,000 - 200,000 = 200,000. Funding's day-count basis is
+  -- lastSettledDate, which the corporate action did NOT advance -- it's
+  -- still the VM's date (Jul 29), so this reset spans 18 days back to
+  -- it: funding = 18,000; net = 182,000, Bob -> Alice.
+  Right afterReset <- submit f.oracle do
+    exerciseCmd rebasedCid SettleReset with
+      asOf = date 2026 Aug 16; indexLevel = 1731.6; observedRate = 0.036
+  aliceBalFinal <- balanceOf f.alice
+  bobBalFinal <- balanceOf f.bob
+  assertMsg "receiver (Alice) credited another 182000" (aliceBalFinal == 1373000.0)
+  assertMsg "payer (Bob) debited another 182000" (bobBalFinal == 627000.0)
+
+  Some trade <- queryContractId f.alice afterReset
+  case trade.history of
+    [_, _, SettlementEvent r] -> assertMsg "residual is 200000" (r.perfAmount == 200000.0)
+    _ -> abort "expected three history entries"
+
+-- Guard: asOf must be strictly after lastSettledDate.
+testStaleAsOfRejected : Script ()
+testStaleAsOfRejected = do
+  f <- setupTrade 1000000.0 1000000.0
+  submitMustFail f.oracle do
+    exerciseCmd f.tradeCid SettleMargin with
+      asOf = date 2026 Jul 20; indexLevel = 16983.0; observedRate = 0.036
+
+-- Guard: indexLevel must be positive.
+testIndexLevelMustBePositiveRejected : Script ()
+testIndexLevelMustBePositiveRejected = do
+  f <- setupTrade 1000000.0 1000000.0
+  submitMustFail f.oracle do
+    exerciseCmd f.tradeCid SettleMargin with
+      asOf = date 2026 Jul 21; indexLevel = 0.0; observedRate = 0.036
+
+-- Guard: an out-of-band funding rate (fat-fingered 3 = 300%) fails loudly.
+testRateOutOfBandRejected : Script ()
+testRateOutOfBandRejected = do
+  f <- setupTrade 1000000.0 1000000.0
+  submitMustFail f.oracle do
+    exerciseCmd f.tradeCid SettleMargin with
+      asOf = date 2026 Jul 21; indexLevel = 16983.0; observedRate = 3.0
+
+-- Guard: a >50% one-day move is rejected as fat-fingered on SettleMargin
+-- specifically (a genuine reset can legitimately span a larger move).
+testDailyMoveFatFingerRejected : Script ()
+testDailyMoveFatFingerRejected = do
+  f <- setupTrade 1000000.0 1000000.0
+  submitMustFail f.oracle do
+    exerciseCmd f.tradeCid SettleMargin with
+      asOf = date 2026 Jul 21; indexLevel = 29970.0; observedRate = 0.036
+
+-- Guard: adjustmentFactor must be positive.
+testCorporateActionFactorMustBePositiveRejected : Script ()
+testCorporateActionFactorMustBePositiveRejected = do
+  f <- setupTrade 1000000.0 1000000.0
+  submitMustFail f.oracle do
+    exerciseCmd f.tradeCid AdjustForCorporateAction with
+      actionType = IndexReconstitution; asOf = date 2026 Jul 21; adjustmentFactor = 0.0
+
+-- Authorization guard: a counterparty cannot self-submit a settlement.
+testPartyCannotSettle : Script ()
+testPartyCannotSettle = do
+  f <- setupTrade 1000000.0 1000000.0
+  submitMustFail f.alice do
+    exerciseCmd f.tradeCid SettleMargin with
+      asOf = date 2026 Jul 21; indexLevel = 16983.0; observedRate = 0.036
+
+-- Default: payer (Bob) owes a VM move it can't cover -> SettlementFailure.
+testInsufficientFundsDefaultsFromSettleMargin : Script ()
+testInsufficientFundsDefaultsFromSettleMargin = do
+  f <- setupTrade 1000000.0 10000.0   -- Bob only has 10k
+  res <- submit f.oracle do
+    exerciseCmd f.tradeCid SettleMargin with
+      asOf = date 2026 Jul 29; indexLevel = 18315.0; observedRate = 0.036  -- Bob owes 991,000
+  case res of
+    Right _ -> abort "expected default, got a live trade"
+    Left defCid -> do
+      Some d <- queryContractId f.alice defCid
+      assertMsg "defaulting party is Bob" (d.defaultingParty == f.bob)
+      assertMsg "amount owed 991000" (d.amountOwed == 991000.0)
+      assertMsg "amount available 10000" (d.amountAvailable == 10000.0)
+      assertMsg "context is SettleMargin" (d.context == "SettleMargin")
+  trades <- query @TRSTrade f.alice
+  assertMsg "no live trade after default" (null trades)
+
+-- Tri-party novation happy path -- identical mechanics to IRS's/CDS's,
+-- driven through the shared Lifecycle interfaces. Bob (payer) steps out
+-- for Charlie; Charlie accepts; Alice (remaining party) confirms.
+testNovationConfirmReplacesParty : Script ()
+testNovationConfirmReplacesParty = do
+  f <- setupTrade 1000000.0 1000000.0
+  let bank = f.bank
+  charlie <- allocateParty "Charlie"
+  _ <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = charlie; label = "Charlie-USD"; currency = USD; amount = 1000000.0; observers = [f.oracle]
+
+  proposalCid <- submit f.bob do
+    exerciseCmd (toInterfaceContractId @INovatable f.tradeCid) ProposeNovation with transferor = f.bob; transferee = charlie
+
+  confirmationCid <- submit charlie do
+    exerciseCmd proposalCid AcceptNovation
+
+  newTradeCid <- fromInterfaceContractId @TRSTrade <$> submit f.alice do
+    exerciseCmd confirmationCid ConfirmNovation
+
+  Some trade <- queryContractId f.alice newTradeCid
+  assertMsg "totalReturnReceiver unchanged" (trade.totalReturnReceiver == f.alice)
+  assertMsg "totalReturnPayer is now Charlie" (trade.totalReturnPayer == charlie)
+
+  liveTrades <- query @TRSTrade f.alice
+  assertMsg "exactly one live trade (the novated one)" (length liveTrades == 1)
+
+-- Novation decline (proposal stage): Charlie rejects outright, original
+-- trade recreated, still settleable afterward.
+testNovationRejectRestoresTrade : Script ()
+testNovationRejectRestoresTrade = do
+  f <- setupTrade 1000000.0 1000000.0
+  charlie <- allocateParty "Charlie"
+
+  proposalCid <- submit f.bob do
+    exerciseCmd (toInterfaceContractId @INovatable f.tradeCid) ProposeNovation with transferor = f.bob; transferee = charlie
+
+  restoredCid <- fromInterfaceContractId @TRSTrade <$> submit charlie do
+    exerciseCmd proposalCid RejectNovation
+
+  Some trade <- queryContractId f.alice restoredCid
+  assertMsg "totalReturnReceiver unchanged" (trade.totalReturnReceiver == f.alice)
+  assertMsg "totalReturnPayer restored to Bob" (trade.totalReturnPayer == f.bob)
+
+  res <- submit f.oracle do
+    exerciseCmd restoredCid SettleMargin with
+      asOf = date 2026 Jul 21; indexLevel = 16983.0; observedRate = 0.036
+  case res of
+    Left _ -> abort "expected restored trade to still settle"
+    Right _ -> pure ()
+
+-- Termination happy path: Alice proposes to end the trade; Bob accepts.
+testTerminationAcceptEndsTrade : Script ()
+testTerminationAcceptEndsTrade = do
+  f <- setupTrade 1000000.0 1000000.0
+  proposalCid <- submit f.alice do
+    exerciseCmd (toInterfaceContractId @ITerminable f.tradeCid) ProposeTermination with proposer = f.alice
+  submit f.bob do
+    exerciseCmd proposalCid AcceptTermination
+
+  liveTrades <- query @TRSTrade f.alice
+  assertMsg "no live trade after termination" (null liveTrades)
+
+-- Termination decline: Bob rejects, original trade recreated, still
+-- settleable afterward.
+testTerminationRejectRestoresTrade : Script ()
+testTerminationRejectRestoresTrade = do
+  f <- setupTrade 1000000.0 1000000.0
+  proposalCid <- submit f.alice do
+    exerciseCmd (toInterfaceContractId @ITerminable f.tradeCid) ProposeTermination with proposer = f.alice
+
+  restoredCid <- fromInterfaceContractId @TRSTrade <$> submit f.bob do
+    exerciseCmd proposalCid RejectTermination
+
+  Some trade <- queryContractId f.alice restoredCid
+  assertMsg "totalReturnReceiver unchanged" (trade.totalReturnReceiver == f.alice)
+  assertMsg "totalReturnPayer unchanged" (trade.totalReturnPayer == f.bob)
+
+  res <- submit f.oracle do
+    exerciseCmd restoredCid SettleMargin with
+      asOf = date 2026 Jul 21; indexLevel = 16983.0; observedRate = 0.036
+  case res of
+    Left _ -> abort "expected restored trade to still settle"
+    Right _ -> pure ()
+
+-- Confirms the transferee's account is genuinely wired in after a full
+-- tri-party novation, AND that accrued state (here: a prior daily VM's
+-- vmPaidSinceReset) survives the party swap -- a settle-after-novation
+-- reset must true up against pre-novation accrual correctly.
+testSettleAfterNovationMovesCash : Script ()
+testSettleAfterNovationMovesCash = do
+  f <- setupTrade 1000000.0 1000000.0
+  let bank = f.bank
+  charlie <- allocateParty "Charlie"
+  _ <- submit bank do
+    createCmd CashHolding with issuer = bank; owner = charlie; label = "Charlie-USD"; currency = USD; amount = 1000000.0; observers = [f.oracle]
+
+  -- Pre-novation VM (+9d): +2% (16650 -> 16983). net = 191,000,
+  -- Bob -> Alice. vmPaidSinceReset = 200,000.
+  Right afterVM <- submit f.oracle do
+    exerciseCmd f.tradeCid SettleMargin with
+      asOf = date 2026 Jul 29; indexLevel = 16983.0; observedRate = 0.036
+
+  proposalCid <- submit f.bob do
+    exerciseCmd (toInterfaceContractId @INovatable afterVM) ProposeNovation with transferor = f.bob; transferee = charlie
+  confirmationCid <- submit charlie do
+    exerciseCmd proposalCid AcceptNovation
+  newTradeCid <- fromInterfaceContractId @TRSTrade <$> submit f.alice do
+    exerciseCmd confirmationCid ConfirmNovation
+
+  Some novated <- queryContractId f.alice newTradeCid
+  assertMsg "vmPaidSinceReset survived the novation" (novated.vmPaidSinceReset == 200000.0)
+  assertMsg "totalReturnPayer is now Charlie" (novated.totalReturnPayer == charlie)
+
+  -- Reset (+9d more) at 16983 (unchanged since the VM): cumulative =
+  -- 200,000; residual = 200,000 - 200,000 = 0; funding = 9,000
+  -- (9-day gap) -> Alice pays Charlie 9,000 through Charlie's OWN
+  -- account.
+  res <- submit f.oracle do
+    exerciseCmd newTradeCid SettleReset with
+      asOf = date 2026 Aug 7; indexLevel = 16983.0; observedRate = 0.036
+  case res of
+    Left _ -> abort "expected trade to continue, got default"
+    Right _ -> pure ()
+  aliceBal <- balanceOf f.alice
+  charlieBal <- balanceOf charlie
+  assertMsg "Alice paid 9000 pure funding" (aliceBal == 1182000.0)
+  assertMsg "Charlie received 9000 through his own account" (charlieBal == 1009000.0)

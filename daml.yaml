@@ -1,5 +1,5 @@
 sdk-version: 2.10.4
-name: canton-swaps
+name: daml-swaps
 source: daml
 version: 0.1.0
 dependencies:

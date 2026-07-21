@@ -1,0 +1,467 @@
+module TRS where
+
+-- Selective import: Types.daml's own LifecycleEvent already exports an
+-- unqualified MarginEvent constructor (part of IRS's sum type). TRS
+-- defines its OWN LifecycleEvent below -- a plain `import Types` would
+-- collide (same reasoning as CDS.daml). Nothing from Types is reused for
+-- TRS's own records (its settlement math doesn't fit MarginRecord's
+-- oracle-asserted markToMarket shape -- the VM here is DERIVED from an
+-- index level, not submitted directly), so only FloatingLeg (the
+-- financing leg) and dayCountFraction are imported.
+import Types (Currency, FloatingLeg(..), dayCountFraction)
+import Cash
+import Lifecycle
+
+-- Mirrors an equity index total return swap: totalReturnReceiver has
+-- synthetic long exposure to indexName -- receiving index performance,
+-- paying financing (a reference rate + spread on notional) -- while
+-- totalReturnPayer (the dealer side) is the reverse. The underlying is
+-- assumed a TOTAL RETURN index (dividends already reinvested in the
+-- published level), so there is deliberately no separate dividend
+-- accounting -- see README.md, "What's intentionally simplified".
+data CorporateActionType
+  = SpecialDividend
+  | StockSplit
+  | MergerAdjustment
+  | IndexReconstitution
+  deriving (Eq, Show)
+
+-- Both cash-settling choices share one record shape; `kind` is the only
+-- thing that says which one produced it.
+data SettlementKind
+  = DailyVM
+  | Reset
+  deriving (Eq, Show)
+
+-- A single settled VM or Reset event. `perfAmount` is the signed index
+-- performance netted against funding to get `netPayment` -- dailyPerf
+-- for DailyVM, the true-up residual for Reset (see SettleReset).
+data TRSSettlementRecord = TRSSettlementRecord
+  with
+    kind          : SettlementKind
+    asOf          : Date
+    indexLevel    : Decimal
+    perfAmount    : Decimal
+    fundingAmount : Decimal
+    netPayment    : Decimal
+    paidBy        : Party
+    paidTo        : Party
+  deriving (Eq, Show)
+
+-- The oracle-submitted rebase the index provider applied (e.g. a divisor
+-- change on reconstitution). No cash moves -- see AdjustForCorporateAction.
+data CorporateActionRecord = CorporateActionRecord
+  with
+    actionType    : CorporateActionType
+    asOf          : Date
+    factor        : Decimal
+    oldResetLevel : Decimal
+    newResetLevel : Decimal
+  deriving (Eq, Show)
+
+-- TRSTrade.history holds both event kinds in one chronological audit
+-- trail, same shape as IRS's/CDS's own LifecycleEvent (see there).
+data LifecycleEvent
+  = SettlementEvent TRSSettlementRecord
+  | CorporateActionEvent CorporateActionRecord
+  deriving (Eq, Show)
+
+
+-- ============================================================
+-- Trade execution: propose -> accept
+-- ============================================================
+
+-- Proposer is always the total return receiver, counterparty always the
+-- payer -- same simplification IRS/CDS make: no separate role-selection
+-- flag needed. AcceptTrade/RejectTrade are inherited from Lifecycle.daml's
+-- IProposable -- see IRS.daml's TradeProposal for the full reasoning.
+template TradeProposal
+  with
+    proposer           : Party
+    counterparty        : Party
+    oracle              : Party
+    cashIssuer          : Party    -- custodian both parties settle through -- see Cash.daml's CashAccountKey
+    settlementCurrency  : Currency
+    notional            : Decimal
+    indexName           : Text
+    initialIndexLevel   : Decimal
+    financingLeg         : FloatingLeg
+    effectiveDate       : Date
+    maturityDate        : Date
+  where
+    signatory proposer
+    observer counterparty, oracle
+
+    ensure notional > 0.0
+        && initialIndexLevel > 0.0
+        && maturityDate > effectiveDate
+
+    interface instance IProposable for TradeProposal where
+      view = VProposable with proposer; counterparty
+      toLiveTrade =
+        toInterface @INovatable $ TRSTrade with
+          totalReturnReceiver = proposer
+          totalReturnPayer = counterparty
+          oracle
+          cashIssuer
+          settlementCurrency
+          notional
+          indexName
+          financingLeg
+          effectiveDate
+          maturityDate
+          lastSettledDate = effectiveDate
+          lastIndexLevel = initialIndexLevel
+          lastResetIndexLevel = initialIndexLevel
+          vmPaidSinceReset = 0.0
+          postedByReceiver = 0.0
+          postedByPayer = 0.0
+          history = []
+
+
+-- ============================================================
+-- The live trade
+-- ============================================================
+
+template TRSTrade
+  with
+    totalReturnReceiver : Party
+    totalReturnPayer    : Party
+    oracle               : Party
+    cashIssuer           : Party
+    settlementCurrency   : Currency
+    notional             : Decimal
+    indexName            : Text
+    financingLeg          : FloatingLeg
+    effectiveDate        : Date
+    maturityDate         : Date
+    lastSettledDate      : Date     -- day-count basis for funding, updated on every settlement (VM or Reset)
+    lastIndexLevel       : Decimal  -- prior observation -- numerator baseline for VM, and VM's own denominator
+    lastResetIndexLevel  : Decimal  -- denominator/anchor for Reset's cumulative return; updated ONLY by SettleReset
+    vmPaidSinceReset     : Decimal  -- running sum of dailyPerf already exchanged since the last reset
+    postedByReceiver     : Decimal  -- cumulative |net| paid by totalReturnReceiver
+    postedByPayer        : Decimal  -- cumulative |net| paid by totalReturnPayer
+    history              : [LifecycleEvent]
+  where
+    signatory totalReturnReceiver, totalReturnPayer
+    observer oracle
+    ensure notional > 0.0
+
+    -- Daily variation margin: a collateral-style settlement of the day's
+    -- ACTUAL move, measured against the prior observation
+    -- (lastIndexLevel), plus funding accrued since the last settlement
+    -- of either kind. Does NOT touch lastResetIndexLevel -- every daily
+    -- VM in a period is still a percentage of the same reset anchor.
+    -- See ARCHITECTURE.md's TRS section for the full daily-VM/reset
+    -- design and why the sum of these can differ from the period's true
+    -- return (the compounding footnote) -- that's exactly what
+    -- SettleReset's residual corrects for.
+    choice SettleMargin : Either (ContractId SettlementFailure) (ContractId TRSTrade)
+      with
+        asOf         : Date
+        indexLevel   : Decimal
+        observedRate : Decimal
+      controller oracle
+      do
+        assertMsg "asOf must not be after maturity"
+          (asOf <= maturityDate)
+        assertMsg "asOf must be after the last settled date"
+          (asOf > lastSettledDate)
+        assertMsg "indexLevel must be positive"
+          (indexLevel > 0.0)
+        assertMsg "observedRate must be a decimal fraction in [0, 1]"
+          (observedRate >= 0.0 && observedRate <= 1.0)
+        -- Fat-finger guard on the DAILY move only -- a genuine reset
+        -- can legitimately span a much larger move after a long gap.
+        assertMsg "Daily index move looks fat-fingered (>50% in one day)"
+          (abs (indexLevel / lastIndexLevel - 1.0) <= 0.5)
+
+        let dayFraction = dayCountFraction financingLeg.dayCount lastSettledDate asOf
+            dailyPerf   = (indexLevel - lastIndexLevel) / lastIndexLevel * notional
+            funding     = (observedRate + financingLeg.spread) * notional * dayFraction
+            net         = dailyPerf - funding
+            amount      = abs net
+            (payer, receiver) =
+              if net >= 0.0
+              then (totalReturnPayer, totalReturnReceiver)
+              else (totalReturnReceiver, totalReturnPayer)
+            record = TRSSettlementRecord with
+              kind = DailyVM
+              asOf
+              indexLevel
+              perfAmount = dailyPerf
+              fundingAmount = funding
+              netPayment = amount
+              paidBy = payer
+              paidTo = receiver
+
+        failed <-
+          if amount > 0.0
+            then tryMoveCash payer amount totalReturnReceiver totalReturnPayer cashIssuer settlementCurrency
+            else pure None
+        case failed of
+          None -> do
+            tradeCid <- create this with
+              lastSettledDate = asOf
+              lastIndexLevel = indexLevel
+              vmPaidSinceReset = vmPaidSinceReset + dailyPerf
+              postedByReceiver = if payer == totalReturnReceiver then postedByReceiver + amount else postedByReceiver
+              postedByPayer = if payer == totalReturnPayer then postedByPayer + amount else postedByPayer
+              history = history ++ [SettlementEvent record]
+            pure (Right tradeCid)
+          Some available -> do
+            defCid <- create SettlementFailure with
+              totalReturnReceiver; totalReturnPayer
+              defaultingParty = payer
+              amountOwed = amount
+              amountAvailable = available
+              context = "SettleMargin"
+              history
+            pure (Left defCid)
+
+    -- Periodic reset: an accounting true-up, not a fresh performance
+    -- payment. Computes the CUMULATIVE return since the last reset
+    -- (against lastResetIndexLevel), pays only the RESIDUAL not already
+    -- exchanged as daily VM (residual = cumulative - vmPaidSinceReset),
+    -- then re-anchors both the denominator and the accumulator for the
+    -- next period. This is self-correcting by construction: whatever
+    -- the daily path was (or even if a daily VM was missed entirely),
+    -- the reset always pays exactly what's still owed -- never a
+    -- second payment for performance already settled. See
+    -- ARCHITECTURE.md's TRS section for the worked compounding example.
+    choice SettleReset : Either (ContractId SettlementFailure) (ContractId TRSTrade)
+      with
+        asOf         : Date
+        indexLevel   : Decimal
+        observedRate : Decimal
+      controller oracle
+      do
+        assertMsg "asOf must not be after maturity"
+          (asOf <= maturityDate)
+        assertMsg "asOf must be after the last settled date"
+          (asOf > lastSettledDate)
+        assertMsg "indexLevel must be positive"
+          (indexLevel > 0.0)
+        assertMsg "observedRate must be a decimal fraction in [0, 1]"
+          (observedRate >= 0.0 && observedRate <= 1.0)
+
+        let dayFraction = dayCountFraction financingLeg.dayCount lastSettledDate asOf
+            cumulative  = (indexLevel - lastResetIndexLevel) / lastResetIndexLevel * notional
+            residual    = cumulative - vmPaidSinceReset
+            funding     = (observedRate + financingLeg.spread) * notional * dayFraction
+            net         = residual - funding
+            amount      = abs net
+            (payer, receiver) =
+              if net >= 0.0
+              then (totalReturnPayer, totalReturnReceiver)
+              else (totalReturnReceiver, totalReturnPayer)
+            record = TRSSettlementRecord with
+              kind = Reset
+              asOf
+              indexLevel
+              perfAmount = residual
+              fundingAmount = funding
+              netPayment = amount
+              paidBy = payer
+              paidTo = receiver
+
+        failed <-
+          if amount > 0.0
+            then tryMoveCash payer amount totalReturnReceiver totalReturnPayer cashIssuer settlementCurrency
+            else pure None
+        case failed of
+          None -> do
+            tradeCid <- create this with
+              lastSettledDate = asOf
+              lastIndexLevel = indexLevel
+              lastResetIndexLevel = indexLevel
+              vmPaidSinceReset = 0.0
+              postedByReceiver = if payer == totalReturnReceiver then postedByReceiver + amount else postedByReceiver
+              postedByPayer = if payer == totalReturnPayer then postedByPayer + amount else postedByPayer
+              history = history ++ [SettlementEvent record]
+            pure (Right tradeCid)
+          Some available -> do
+            defCid <- create SettlementFailure with
+              totalReturnReceiver; totalReturnPayer
+              defaultingParty = payer
+              amountOwed = amount
+              amountAvailable = available
+              context = "SettleReset"
+              history
+            pure (Left defCid)
+
+    -- Corporate action: the index provider rebases the published level
+    -- (e.g. a divisor change on reconstitution). No cash moves -- this
+    -- is a pure state-mutating oracle event, a shape IRS/CDS don't have
+    -- (their oracle choices always settle cash). Both index anchors are
+    -- in published-index units, so BOTH must be rebased by the same
+    -- factor -- otherwise the next settlement compares a post-rebase
+    -- level against a pre-rebase anchor and books phantom P&L ("phantom
+    -- VM"). Guarded only for positivity, not a tight fat-finger band:
+    -- legitimate rebasings can be large (e.g. x0.01 on a reconstitution)
+    -- -- deliberately weaker than SettleMargin's daily-move guard.
+    --
+    -- Controlled by `oracle`, same as every other choice here, but this
+    -- one is conceptually an ISDA "Calculation Agent" determination
+    -- (a discretionary adjustment call), not a routine market-data
+    -- observation like indexLevel/observedRate -- worth naming even
+    -- though this codebase doesn't model that as a separate party (see
+    -- README.md's TRS simplifications).
+    --
+    -- One risk this choice does NOT close: if `oracle` submits a
+    -- post-event level straight into SettleMargin/SettleReset without
+    -- calling this choice first, the phantom-VM problem happens anyway
+    -- -- the guard against comparing a rebased level to a stale anchor
+    -- only exists here, not inside the settlement choices themselves.
+    -- That's an operational-sequencing dependency on the oracle/calc
+    -- agent, consistent with every other trusted-oracle-input
+    -- simplification in this codebase (see ARCHITECTURE.md's TRS
+    -- section), not something either choice's code can enforce alone.
+    choice AdjustForCorporateAction : ContractId TRSTrade
+      with
+        actionType       : CorporateActionType
+        asOf             : Date
+        adjustmentFactor : Decimal
+      controller oracle
+      do
+        assertMsg "asOf must not be after maturity"
+          (asOf <= maturityDate)
+        assertMsg "adjustmentFactor must be positive"
+          (adjustmentFactor > 0.0)
+
+        let record = CorporateActionRecord with
+              actionType
+              asOf
+              factor = adjustmentFactor
+              oldResetLevel = lastResetIndexLevel
+              newResetLevel = lastResetIndexLevel * adjustmentFactor
+
+        create this with
+          lastIndexLevel = lastIndexLevel * adjustmentFactor
+          lastResetIndexLevel = lastResetIndexLevel * adjustmentFactor
+          history = history ++ [CorporateActionEvent record]
+
+    -- Novation and termination are inherited from Lifecycle.daml's
+    -- INovatable/ITerminable interfaces -- identical mechanics to
+    -- IRS's/CDS's, see IRS.daml's own interface instances for the
+    -- annotated version.
+    interface instance INovatable for TRSTrade where
+      view = VNovatable with
+        partyA = totalReturnReceiver
+        partyB = totalReturnPayer
+        oracle
+      toNovationProposal transferor transferee =
+        let remainingParty = if transferor == totalReturnReceiver then totalReturnPayer else totalReturnReceiver
+        in toInterface @INovationProposal $ NovationProposal with
+             orig = this; transferor; transferee; remainingParty
+
+    interface instance ITerminable for TRSTrade where
+      view = VTerminable with
+        partyA = totalReturnReceiver
+        partyB = totalReturnPayer
+        oracle
+      toTerminationProposal proposer =
+        let otherParty = if proposer == totalReturnReceiver then totalReturnPayer else totalReturnReceiver
+        in toInterface @ITerminationProposal $ TerminationProposal with
+             orig = this; proposer; otherParty
+
+
+-- ============================================================
+-- Novation: propose -> accept/reject -> confirm/decline (tri-party)
+-- ============================================================
+-- Same shape as IRS.daml's/CDS.daml's NovationProposal/NovationConfirmation
+-- -- see IRS.daml for the full authority-carrying explanation.
+
+template NovationProposal
+  with
+    orig           : TRSTrade
+    transferor     : Party
+    transferee     : Party
+    remainingParty : Party
+  where
+    signatory (signatory orig)
+    observer transferee, orig.oracle
+
+    interface instance INovationProposal for NovationProposal where
+      view = VNovationProposal with
+        partyA = orig.totalReturnReceiver
+        partyB = orig.totalReturnPayer
+        oracle = orig.oracle
+        transferor; transferee; remainingParty
+      trade = toInterface @INovatable orig
+      toNovationConfirmation =
+        toInterface @INovationConfirmation $ NovationConfirmation with
+          orig; transferor; transferee; remainingParty
+
+
+template NovationConfirmation
+  with
+    orig           : TRSTrade
+    transferor     : Party
+    transferee     : Party
+    remainingParty : Party
+  where
+    signatory (signatory orig ++ [transferee])
+    observer orig.oracle
+
+    interface instance INovationConfirmation for NovationConfirmation where
+      view = VNovationConfirmation with
+        partyA = orig.totalReturnReceiver
+        partyB = orig.totalReturnPayer
+        oracle = orig.oracle
+        transferor; transferee; remainingParty
+      originalTrade = toInterface @INovatable orig
+      -- No cash account to swap any more -- see IRS.daml's
+      -- NovationConfirmation.substitute for the full reasoning. Anchors
+      -- (lastIndexLevel/lastResetIndexLevel), vmPaidSinceReset, and
+      -- lastSettledDate all ride along unchanged -- a position novates
+      -- mid-period with its accrued economics intact.
+      substitute =
+        toInterface @INovatable $ orig with
+          totalReturnReceiver = if transferor == orig.totalReturnReceiver then transferee else orig.totalReturnReceiver
+          totalReturnPayer = if transferor == orig.totalReturnPayer then transferee else orig.totalReturnPayer
+
+
+-- ============================================================
+-- Early termination: propose -> accept/reject
+-- ============================================================
+
+template TerminationProposal
+  with
+    orig       : TRSTrade
+    proposer   : Party
+    otherParty : Party
+  where
+    signatory (signatory orig)
+    observer otherParty, orig.oracle
+
+    interface instance ITerminationProposal for TerminationProposal where
+      view = VTerminationProposal with
+        partyA = orig.totalReturnReceiver
+        partyB = orig.totalReturnPayer
+        oracle = orig.oracle
+        proposer; otherParty
+      terminatingTrade = toInterface @ITerminable orig
+
+
+-- ============================================================
+-- Terminal state: default
+-- ============================================================
+
+-- Created when a VM/Reset payment can't be covered by the defaulting
+-- party's account -- same terminal-by-construction pattern as
+-- IRS.SettlementFailure/CDS.SettlementFailure (see there). Note early
+-- termination pays no close-out amount (see README.md's "What's
+-- intentionally simplified") -- this template is strictly about a
+-- failed VM/Reset payment, not a negotiated exit.
+template SettlementFailure
+  with
+    totalReturnReceiver : Party
+    totalReturnPayer    : Party
+    defaultingParty     : Party
+    amountOwed          : Decimal
+    amountAvailable     : Decimal
+    context             : Text
+    history              : [LifecycleEvent]
+  where
+    signatory totalReturnReceiver, totalReturnPayer

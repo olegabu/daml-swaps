@@ -3,8 +3,9 @@
 Reference notes for whoever is building on this project, so contract and
 client code stays consistent with how Canton actually works rather than
 assumptions carried over from other DLT stacks (Ethereum, Hyperledger
-Fabric). Organized into **Common** concepts (apply to both IRS and CDS,
-and to Canton generally), then what's specific to **IRS** and **CDS**.
+Fabric). Organized into **Common** concepts (apply to IRS, CDS, and TRS
+alike, and to Canton generally), then what's specific to **IRS**, **CDS**,
+and **TRS**.
 
 ## Common
 
@@ -37,16 +38,17 @@ and to Canton generally), then what's specific to **IRS** and **CDS**.
 
 ### Shared lifecycle via interfaces
 
-IRS and CDS are two economically different products, but their trade
-origination, novation, and termination mechanics — propose →
+IRS, CDS, and TRS are three economically different products, but their
+trade origination, novation, and termination mechanics — propose →
 accept/reject, then (for novation) confirm/decline by a third party —
 are *structurally identical*: same guards, same authority-carrying
-trick. Rather than writing that logic twice under
+trick. Rather than writing that logic three times under
 name-compatible-but-separate templates, `Lifecycle.daml` hosts it
 **once**, as three Daml interfaces (`IProposable`, `INovatable`/
 `ITerminable` and their proposal/confirmation counterparts), and
-`IRSTrade`/`CDSTrade` each implement a handful of small per-product
-hooks. `IProposable` is the simplest of the three — just one per-product
+`IRSTrade`/`CDSTrade`/`TRSTrade` each implement a handful of small
+per-product hooks. `IProposable` is the simplest of the three — just one
+per-product
 hook (`toLiveTrade`) and a `RejectTrade` choice whose body
 (`controller (view this).counterparty; do pure ()`) is *identical* down
 to the byte across products, not just structurally similar; `INovatable`/
@@ -71,8 +73,9 @@ this)` (recreating that embedded value verbatim, fresh contract id), no
 field-by-field reconstruction. `IProposable`'s `TradeProposal` has
 nothing to embed this way — there's no prior live trade yet, just its
 own product-specific economic terms (`fixedLeg`/`floatingLeg` vs.
-`premiumLeg`/`referenceEntity`) sitting directly on the template, same
-as before — `toLiveTrade` builds the *first* live trade from those
+`premiumLeg`/`referenceEntity` vs. `indexName`/`initialIndexLevel`/
+`financingLeg`) sitting directly on the template, same as before —
+`toLiveTrade` builds the *first* live trade from those
 fields plus `proposer`/`counterparty`, rather than reconstructing an
 existing one.
 
@@ -140,8 +143,8 @@ exerciseCmd (toInterfaceContractId @IProposable proposalCid) AcceptTrade
 trade back (to exercise `SettleCashflow`/`SettlePremium`/etc., which
 *aren't* interface choices) convert once more with
 `fromInterfaceContractId`, same as above — see `Setup.daml` and
-`IRSTest.daml`/`CDSTest.daml`'s `setupTrade` for both conversions
-chained back to back.
+`IRSTest.daml`/`CDSTest.daml`/`TRSTest.daml`'s `setupTrade` for both
+conversions chained back to back.
 
 ### Authority vs. visibility (two separate things)
 
@@ -490,28 +493,31 @@ transaction hash with its own key before one combined submission — this
 project targets SDK 2.10.4, where propose-accept (now shared via
 interfaces for novation/termination) is the available pattern.
 
-### Qualified imports: two products, one vocabulary
+### Qualified imports: three products, one vocabulary
 
-`IRS.daml` and `CDS.daml` both define `TradeProposal`, `NovationProposal`,
-`NovationConfirmation`, `TerminationProposal`, and `SettlementFailure` —
-same names, deliberately, because they play the same role in each
-product's lifecycle and there's no value in inventing product-prefixed
-names for structurally identical concepts. (`AcceptTrade`/`RejectTrade`/
-`ProposeNovation`/etc. themselves aren't independently defined in either
-file any more — they're inherited from `Lifecycle.daml`'s interfaces, see
-above — so there's nothing to qualify for those specifically.) Any module
-that needs both templates (`Setup.daml`, and any future cross-product
-client code) imports them **qualified**:
+`IRS.daml`, `CDS.daml`, and `TRS.daml` all define `TradeProposal`,
+`NovationProposal`, `NovationConfirmation`, `TerminationProposal`, and
+`SettlementFailure` — same names, deliberately, because they play the
+same role in each product's lifecycle and there's no value in inventing
+product-prefixed names for structurally identical concepts.
+(`AcceptTrade`/`RejectTrade`/`ProposeNovation`/etc. themselves aren't
+independently defined in any file any more — they're inherited from
+`Lifecycle.daml`'s interfaces, see above — so there's nothing to qualify
+for those specifically.) Any module that needs more than one of these
+templates (`Setup.daml`, and any future cross-product client code)
+imports them **qualified**:
 
 ```haskell
 import qualified IRS
 import qualified CDS
+import qualified TRS
 ```
 
-and refers to `IRS.TradeProposal`, `CDS.TradeProposal`, etc. Modules that
-only ever touch one product (`IRSTest.daml` → IRS only, `CDSTest.daml` → CDS
-only) import unqualified as usual, since there's nothing to disambiguate.
-The one thing qualification does *not* fix is Daml interface method names
+and refers to `IRS.TradeProposal`, `CDS.TradeProposal`, `TRS.TradeProposal`,
+etc. Modules that only ever touch one product (`IRSTest.daml` → IRS only,
+`CDSTest.daml` → CDS only, `TRSTest.daml` → TRS only) import unqualified
+as usual, since there's nothing to disambiguate. The one thing
+qualification does *not* fix is Daml interface method names
 sharing a flat per-module namespace (see "Shared lifecycle via
 interfaces" above) — that's a different, module-internal collision that
 qualified importing elsewhere can't help with, which is why
@@ -519,10 +525,12 @@ qualified importing elsewhere can't help with, which is why
 `INovationProposal.trade` inside `Lifecycle.daml` itself.
 
 `TradeProposal`'s *template* — its own product-specific economic
-terms — stays duplicated per product, same as `IRSTrade`/`CDSTrade`
-themselves do; there's no shared shape to give `fixedLeg`/`floatingLeg`
-and `premiumLeg`/`referenceEntity` beyond what `Types.daml` already
-reuses (`FixedLeg`). Its *choice logic* (`AcceptTrade`/`RejectTrade`) is
+terms — stays duplicated per product, same as `IRSTrade`/`CDSTrade`/
+`TRSTrade` themselves do; there's no shared shape to give
+`fixedLeg`/`floatingLeg`, `premiumLeg`/`referenceEntity`, and
+`indexName`/`initialIndexLevel`/`financingLeg` beyond what `Types.daml`
+already reuses (`FixedLeg` for IRS/CDS, `FloatingLeg` again for TRS's
+financing leg). Its *choice logic* (`AcceptTrade`/`RejectTrade`) is
 unified through `IProposable`, exactly like novation/termination —
 earlier notes in this file claimed otherwise ("no existing trade to
 embed at proposal time, so the embedded-value trick doesn't apply"),
@@ -534,8 +542,9 @@ live trade, which `toLiveTrade` is.
 
 `SettlementFailure` is the one template that genuinely doesn't unify:
 its `history` field is differently-typed per product (IRS's
-`CashflowEvent`/`MarginEvent` vs. CDS's
-`PremiumEvent`/`MarginEvent`/`CreditEventEntry`), so there's no single
+`CashflowEvent`/`MarginEvent`, CDS's
+`PremiumEvent`/`MarginEvent`/`CreditEventEntry`, TRS's
+`SettlementEvent`/`CorporateActionEvent`), so there's no single
 interface method signature that could return it — unifying it would
 need the embedded-value trick applied to a type that doesn't have one
 natural underlying "trade" to embed, the same gap that's real for
@@ -543,24 +552,46 @@ novation/termination's confirmation stage but not for origination.
 
 ### Oracle / calculation-agent pattern
 
-Every settlement/margin/credit-event choice in both products is
+Every settlement/margin/credit-event choice in all three products is
 controlled *solely* by an oracle party that submits only an objective
-external number (a rate fixing, a mark-to-market, a recovery rate) and
-never a party or contract ID — so it stays oblivious to counterparty
-identities. The contract itself derives who owes whom and by how much.
-This mirrors real practice: rate fixings come from an independent
-administrator, and for centrally-cleared trades the CCP computes and
-calls margin unilaterally. (For *uncleared* bilateral trades, margin is
-instead each party calculating independently and reconciling disputes —
-a deliberate simplification here.) Guarding these inputs against
-fat-fingers (e.g. a rate or recovery rate must be a decimal fraction in
-`[0,1]`) keeps a typo from silently defaulting — or, for CDS's credit
-event, silently mis-paying — the trade.
+external number (a rate fixing, a mark-to-market, a recovery rate, an
+index level) and never a party or contract ID — so it stays oblivious to
+counterparty identities. The contract itself derives who owes whom and
+by how much. This mirrors real practice: rate fixings come from an
+independent administrator, and for centrally-cleared trades the CCP
+computes and calls margin unilaterally. (For *uncleared* bilateral
+trades, margin is instead each party calculating independently and
+reconciling disputes — a deliberate simplification here.) Guarding these
+inputs against fat-fingers (e.g. a rate or recovery rate must be a
+decimal fraction in `[0,1]`) keeps a typo from silently defaulting — or,
+for CDS's credit event, silently mis-paying — the trade.
+
+**The inputs are trade-agnostic, not just party-agnostic.** The oracle
+submits the SAME published number — an index level, a rate fixing —
+regardless of which trade, or how many trades, reference it: one
+published `SOFR` fixing serves every IRS in this codebase that floats
+off it, and one published `SPX-TR` level serves every TRS on that index,
+the same way one real-world rate administrator or index provider serves
+every market participant simultaneously. Nothing about the oracle's
+input encodes which trade it's for; that's derived entirely from which
+contract the choice happens to be exercised on.
+
+**Not every oracle choice moves cash — TRS's `AdjustForCorporateAction`
+is the first one that structurally can't.** Every settlement/margin/
+credit-event choice above returns `Either (ContractId SettlementFailure)
+(ContractId <Trade>)`, because a cash leg can fail (insufficient funds).
+A corporate-action rebase has no cash leg at all — it only rescales
+`TRSTrade`'s own stored index levels — so it can't fail that way, and
+its return type reflects that honestly: plain `ContractId TRSTrade`, no
+`Either`, nothing for a caller to handle on a "declined" branch that
+structurally cannot occur. The return-type difference **is** the
+cash-settling-vs-state-mutating distinction, visible directly in the
+choice's signature rather than needing a comment to explain it.
 
 ```mermaid
 sequenceDiagram
     actor Oracle
-    participant Trade as IRSTrade / CDSTrade
+    participant Trade as IRSTrade / CDSTrade / TRSTrade
     participant PayerCash as Payer's CashHolding
     participant ReceiverCash as Receiver's CashHolding
 
@@ -584,26 +615,30 @@ holder a creditor of a private issuer — a materially weaker claim, worth
 being deliberate about which one this project's `CashHolding` is meant to
 stand in for.
 
-Both products implement that atomic DvP the same way, via **`Cash.daml`'s
-shared `tryMoveCash` helper**: given a payer, an amount, both parties'
-identities, and the trade's agreed `cashIssuer`/`settlementCurrency`, it
-resolves the payer's **current** `CashHolding` by key
-(`fetchByKey`/`exerciseByKey` against `CashAccountKey = issuer + owner +
-currency`) and exercises a single `Transfer` to the receiver's account
-(also resolved by key), returning `None` on success or the payer's actual
-available balance (`Some available`) on failure — see "Mint vs. transfer"
-above for exactly how that one nested `Transfer`/`CreditAccount` pair
-gets authorized without the oracle being a controller of either. Each
-product's settlement choice (`SettleCashflow`/`SettleMargin`
-for IRS, `SettlePremium`/`SettleMargin`/`SettleCreditEvent` for CDS)
-computes its own product-specific amount and direction, then hands off to
-`tryMoveCash` and recreates the trade (or, on `Some`, builds its own
-`SettlementFailure` — see "Qualified imports" above for why that record
-stays per-product). If the payer's account can't cover the amount, the
-same transaction instead archives the trade into a terminal
-`SettlementFailure` (no successor trade for IRS/CDS's periodic choices,
-so the ledger structurally prevents any further lifecycle action on that
-path).
+All three products implement that atomic DvP the same way, via
+**`Cash.daml`'s shared `tryMoveCash` helper**: given a payer, an amount,
+both parties' identities, and the trade's agreed
+`cashIssuer`/`settlementCurrency`, it resolves the payer's **current**
+`CashHolding` by key (`fetchByKey`/`exerciseByKey` against
+`CashAccountKey = issuer + owner + currency`) and exercises a single
+`Transfer` to the receiver's account (also resolved by key), returning
+`None` on success or the payer's actual available balance (`Some
+available`) on failure — see "Mint vs. transfer" above for exactly how
+that one nested `Transfer`/`CreditAccount` pair gets authorized without
+the oracle being a controller of either. Each product's settlement
+choice (`SettleCashflow`/`SettleMargin` for IRS,
+`SettlePremium`/`SettleMargin`/`SettleCreditEvent` for CDS,
+`SettleMargin`/`SettleReset` for TRS) computes its own product-specific
+amount and direction, then hands off to `tryMoveCash` and recreates the
+trade (or, on `Some`, builds its own `SettlementFailure` — see
+"Qualified imports" above for why that record stays per-product). If the
+payer's account can't cover the amount, the same transaction instead
+archives the trade into a terminal `SettlementFailure` (no successor
+trade for any product's periodic choices, so the ledger structurally
+prevents any further lifecycle action on that path). TRS's
+`AdjustForCorporateAction` is the one settlement-adjacent choice with no
+cash leg to hand off at all — see "Oracle / calculation-agent pattern"
+above.
 
 Crucially, **the trade itself stores no `ContractId CashHolding` at
 all** — only the `cashIssuer`/`settlementCurrency` it takes to build the
@@ -641,11 +676,11 @@ single-day-count-convention caveat.
 
 ## CDS
 
-The credit event is CDS's one choice with no IRS analogue: it's the only
-choice in either product that's **terminal regardless of outcome** — a
-credit event ends the trade whether the payout succeeds or the seller
-can't cover it, unlike periodic settlement/margin, where only the
-*failure* branch is terminal.
+The credit event is CDS's one choice with no IRS or TRS analogue: it's
+the only choice in any product that's **terminal regardless of
+outcome** — a credit event ends the trade whether the payout succeeds or
+the seller can't cover it, unlike periodic settlement/margin, where only
+the *failure* branch is terminal.
 
 ```mermaid
 stateDiagram-v2
@@ -664,6 +699,130 @@ IRS uses. See `README.md`'s demo for the worked example and "What's
 intentionally simplified" for what a real ISDA auction-settled credit
 event does differently (auction-discovered recovery rate, accrued-premium
 proration, no upfront-payment convention here).
+
+## TRS
+
+TRS's daily VM + periodic reset design is the one place in this codebase
+where a product tracks its own accrual state across *multiple*
+settlements to get the economics right — IRS's `SettleCashflow` only
+needs `lastSettledDate`; TRS needs that plus three more fields
+(`lastIndexLevel`, `lastResetIndexLevel`, `vmPaidSinceReset`) because two
+different oracle choices (`SettleMargin`, `SettleReset`) both settle
+against the *same* underlying index, on different timeframes, and must
+never double-pay the same performance.
+
+**The residual formula, and why it's self-correcting by construction.**
+`SettleMargin` (daily VM) measures each day's move against the **prior
+observation** and settles it immediately, collateral-style:
+
+```
+dailyPerf = (indexLevel − lastIndexLevel) / lastIndexLevel × notional
+```
+
+`SettleReset` (the periodic true-up) measures the **cumulative** return
+since the last reset, against the fixed `lastResetIndexLevel` anchor —
+but pays only what daily VM hasn't already exchanged:
+
+```
+cumulative = (indexLevel − lastResetIndexLevel) / lastResetIndexLevel × notional
+residual   = cumulative − vmPaidSinceReset
+```
+
+Whatever `vmPaidSinceReset` holds — zero, the full cumulative move, or
+anything in between, regardless of how many daily VMs ran or were
+missed — `residual` is *defined* as the gap between the true cumulative
+return and what's already been paid. There's no scenario where
+performance gets paid twice: the reset formula corrects for the actual
+history, not an assumed one.
+
+**The compounding footnote.** A natural claim is "the sum of daily VM
+payments always equals the period's total return, so the reset should
+always net to zero." That's true only under a *level-difference*
+(futures-style) convention — `(indexLevelₜ − indexLevelₜ₋₁) × units` —
+where daily payments telescope: consecutive terms cancel algebraically,
+leaving exactly the first-to-last difference. This codebase instead uses
+the **prior-day-percentage** convention (`SettleMargin`'s formula
+above), which is standard for daily-resetting equity swaps but does
+**not** telescope — each day's percentage move applies to a *different*
+notional base (the prior day's, which itself already moved), the same
+compounding effect documented for daily-reset leveraged ETFs. Concretely:
+16650 → 18315 (+10%) → 16483.5 (−10% of 18315, not of 16650) pays 0 net
+across the two days, yet the index is genuinely down 1% end to end. The
+residual is exactly that compounding gap — `TRSTest.daml`'s
+`testCompoundingResidualTruedUpByReset` pins this scenario precisely,
+and README.md's TRS section walks the identical numbers live. This isn't
+a bug in the daily-VM convention; it's the documented, expected behavior
+of path-dependent daily resetting, and the reset's job is precisely to
+true it up — not to net to zero.
+
+**`vmPaidSinceReset` is the price analog of `lastSettledDate`.**
+`lastSettledDate` exists so a settlement's day-count basis comes from
+the *contract's own recorded state*, not a second oracle-submitted date
+that could drift or be resubmitted wrong (see "Settlement / cash leg"
+above). `vmPaidSinceReset` plays the identical role for price: rather
+than trusting the oracle (or a caller) to separately track "how much
+performance has this trade already paid out this period," the contract
+accumulates it itself, on every `SettleMargin`, and `SettleReset` reads
+it back — the same "derive from state you already control" discipline,
+applied to price instead of dates.
+
+**Why `AdjustForCorporateAction` rebases *both* anchors together.**
+`lastIndexLevel` and `lastResetIndexLevel` are both expressed in the
+same published-index units. If a provider rescales the index (a stock
+split, special dividend, or reconstitution) and only one anchor were
+rebased, the next settlement would compare a rebased number against a
+stale one and book a phantom gain or loss proportional to the rebase
+factor — e.g. a ×0.01 rebase applied to only one anchor would look like
+a ~99% move overnight. Rebasing both together, by the same factor, keeps
+every subsequent ratio-based calculation (`SettleMargin`'s and
+`SettleReset`'s formulas above are both pure ratios) invariant under the
+rescaling — see `TRSTest.daml`'s `testCorporateActionRebaseNoPhantomLoss`.
+`vmPaidSinceReset`, by contrast, is **not** rebased — it's already
+denominated in currency, and a currency amount doesn't change meaning
+just because the index's unit scale did; `testCorporateActionRebaseThenResetResidualCorrect`
+confirms the reset's residual still comes out correct after a mid-period
+rebase for exactly this reason. `lastSettledDate` is untouched by a
+corporate action too, for an unrelated reason: it's a *funding* accrual
+basis, and a corporate action isn't a settlement — see README.md's TRS
+section, step 4, for this traced through a concrete date gap.
+
+```mermaid
+stateDiagram-v2
+    [*] --> TRSTrade
+    TRSTrade --> TRSTrade: SettleMargin / SettleReset (success -- trade continues)
+    TRSTrade --> SettlementFailure: SettleMargin / SettleReset (payer can't cover it)
+    TRSTrade --> TRSTrade: AdjustForCorporateAction (no cash leg -- can't fail this way)
+    SettlementFailure --> [*]
+```
+
+**`AdjustForCorporateAction` is a Calculation Agent act wearing the
+oracle's clothes — and one risk it doesn't close.** Real ISDA practice
+distinguishes a party that merely *reports* objective market data (a
+rate fixing, an index level) from the **Calculation Agent**, who makes
+*discretionary determinations* — exactly what "how do we rebase for this
+corporate action" is. This codebase doesn't model that as a separate
+party: `oracle` controls `AdjustForCorporateAction` the same as every
+other choice, for the same reason `Types.daml`'s day-count/rate machinery
+stays inside the Daml choice rather than an off-ledger pricing engine —
+keeping the party model small. Worth naming anyway, because it's a real
+simplification: a production deployment would likely split these into
+two roles with different trust levels and legal responsibility.
+
+That said, splitting the party wouldn't close the one real gap here: **a
+single multiplicative `adjustmentFactor` applied to both anchors
+prevents phantom VM only if the calculation agent actually calls
+`AdjustForCorporateAction` before the next `SettleMargin`/`SettleReset`
+observes a post-event level.** If the oracle instead submits a raw
+post-split level straight into `SettleMargin` — forgetting the rebase
+step — the contract has no way to know the discontinuity was a corporate
+action rather than a genuine (fat-fingered-looking, but real) market
+move, and computes exactly the catastrophic phantom daily VM this choice
+exists to prevent. Neither an on-ledger invariant assertion nor a second
+party role would close this by itself — it's an operational-sequencing
+dependency on whoever submits oracle data, the same category of trust
+this codebase already places in every other oracle input (see "Oracle /
+calculation-agent pattern" above); it just has a sharper failure mode
+here than a wrong rate fixing would.
 
 ## Core concepts
 

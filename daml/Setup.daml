@@ -6,12 +6,13 @@ import Cash
 import Lifecycle
 import qualified IRS
 import qualified CDS
+import qualified TRS
 import Types
 
--- IRS and CDS are qualified imports -- both modules define
+-- IRS, CDS and TRS are qualified imports -- all three modules define
 -- TradeProposal/AcceptTrade/NovationProposal/SettlementFailure etc. under
 -- the same names (see ARCHITECTURE.md, "Qualified imports: two products,
--- one vocabulary"), so every reference below is IRS.Foo or CDS.Foo.
+-- one vocabulary"), so every reference below is IRS.Foo, CDS.Foo or TRS.Foo.
 data Parties = Parties with
     alice   : Party
     bob     : Party
@@ -31,13 +32,15 @@ setup = do
 
   irsProposalCid <- proposeIrsTrade parties
   cdsProposalCid <- proposeCdsTrade parties
+  trsProposalCid <- proposeTrsTrade parties
 
-  -- Comment out either (or both) of these two lines to demo AcceptTrade
-  -- manually from Navigator instead of having it already done: the
-  -- corresponding TradeProposal will be sitting there, live, waiting for
-  -- Bob to open it and exercise AcceptTrade himself.
+  -- Comment out any of these three lines to demo AcceptTrade manually
+  -- from Navigator instead of having it already done: the corresponding
+  -- TradeProposal will be sitting there, live, waiting for Bob to open
+  -- it and exercise AcceptTrade himself.
   -- acceptIrsTrade parties irsProposalCid
   -- acceptCdsTrade parties cdsProposalCid
+  -- acceptTrsTrade parties trsProposalCid
 
   pure ()
 
@@ -151,6 +154,36 @@ proposeCdsTrade parties =
 -- Bob accepts, making the CDSTrade live.
 acceptCdsTrade : Parties -> ContractId CDS.TradeProposal -> Script ()
 acceptCdsTrade parties proposalCid = do
+  _ <- submit parties.bob do
+    exerciseCmd (toInterfaceContractId @IProposable proposalCid) AcceptTrade
+  pure ()
+
+-- Proposes a live TRSTrade the same way: Alice receives the total return
+-- of the SPX-TR index from Bob, funded at SOFR flat, on a 10,000,000
+-- notional -- same seed terms as TRSTest.daml's fixture.
+proposeTrsTrade : Parties -> Script (ContractId TRS.TradeProposal)
+proposeTrsTrade parties =
+  submit parties.alice do
+    createCmd TRS.TradeProposal with
+      proposer = parties.alice
+      counterparty = parties.bob
+      oracle = parties.oracle
+      cashIssuer = parties.bank
+      settlementCurrency = USD
+      notional = 10000000.0
+      indexName = "SPX-TR"
+      initialIndexLevel = 16650.0
+      financingLeg = FloatingLeg with
+        floatingIndex = SOFR
+        spread = 0.0
+        dayCount = Act360
+        frequency = Quarterly
+      effectiveDate = date 2026 Jul 20
+      maturityDate = date 2027 Jul 20
+
+-- Bob accepts, making the TRSTrade live.
+acceptTrsTrade : Parties -> ContractId TRS.TradeProposal -> Script ()
+acceptTrsTrade parties proposalCid = do
   _ <- submit parties.bob do
     exerciseCmd (toInterfaceContractId @IProposable proposalCid) AcceptTrade
   pure ()

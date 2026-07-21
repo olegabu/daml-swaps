@@ -1,23 +1,24 @@
-# IRS and CDS on Canton/DAML
+# IRS, CDS, and TRS on Canton/DAML
 
 ## What this is
 
-A learning/prototyping project: an Interest Rate Swap (IRS) and a Credit
-Default Swap (CDS), both modeled as DAML smart contracts, intended to run
-on Canton. The code is intentionally close to real derivatives lifecycle
-mechanics: execution, periodic settlement, variation margin, novation, and
-termination — with settlement modeled as **atomic delivery-versus-payment
-(DvP)**: cash moves in the *same transaction* as the trade's state update,
-never as a separate off-ledger step.
+A learning/prototyping project: an Interest Rate Swap (IRS), a Credit
+Default Swap (CDS), and an equity index Total Return Swap (TRS), all
+modeled as DAML smart contracts, intended to run on Canton. The code is
+intentionally close to real derivatives lifecycle mechanics: execution,
+periodic settlement, variation margin, novation, and termination — with
+settlement modeled as **atomic delivery-versus-payment (DvP)**: cash moves
+in the *same transaction* as the trade's state update, never as a separate
+off-ledger step.
 
-The two products share their novation and termination mechanics through a
-single Daml **interface** implementation (`Lifecycle.daml`) rather than
-two copies of the same logic — see "Modules" below and
+All three products share their novation and termination mechanics through
+a single Daml **interface** implementation (`Lifecycle.daml`) rather than
+three copies of the same logic — see "Modules" below and
 [ARCHITECTURE.md](ARCHITECTURE.md) for why and how.
 
 ## Roles
 
-### Common to both products
+### Common to all three products
 
 - **Oracle** — the calculation/settlement agent. The *sole* controller of
   every settlement/margin/credit-event choice. It submits only objective
@@ -41,11 +42,20 @@ two copies of the same logic — see "Modules" below and
   collects the premium and is on the hook for the contingent payout if a
   credit event occurs. Signatories of the trade.
 
+### TRS
+
+- **`totalReturnReceiver` / `totalReturnPayer`** — the two trade
+  counterparties. The receiver gets the index's total return (price
+  appreciation plus reinvested dividends — see `TRS.daml` below) and pays
+  financing; the payer — the dealer side, already capitalized against the
+  swing — pays the index return and collects financing. Signatories of
+  the trade.
+
 ## Modules
 
-`daml/` contains eight modules:
+`daml/` contains ten modules:
 
-- **`Types.daml`** — supporting data types shared by both products:
+- **`Types.daml`** — supporting data types shared by all three products:
   `FixedLeg`, `FloatingLeg`, `CashflowRecord`, `MarginRecord` (IRS's own
   `LifecycleEvent` sum type wraps the last two), plus closed enums
   `DayCountConvention`, `Frequency`, `Currency` (USD/EUR), and
@@ -54,13 +64,15 @@ two copies of the same logic — see "Modules" below and
   holiday/business-day adjustment). `FixedLeg` is reused as-is for CDS's
   premium leg (`rate` = the running spread, e.g. `0.01` = 100bps) — same
   `rate`/`dayCount`/`frequency` shape as an IRS fixed coupon, so there's no
-  parallel `PremiumLeg` type. Shaped like ISDA CDM's auto-generated data
-  classes in spirit, simplified. Not a copy of ISDA/Digital Asset's actual
-  CDM-DAML source.
+  parallel `PremiumLeg` type; `FloatingLeg` is reused as-is for TRS's
+  financing leg the same way (`spread` on top of the oracle-submitted
+  overnight rate). Shaped like ISDA CDM's auto-generated data classes in
+  spirit, simplified. Not a copy of ISDA/Digital Asset's actual CDM-DAML
+  source.
 - **`Cash.daml`** — a minimal tokenized `CashHolding`, identified by a
   **contract key** (`CashAccountKey` = issuer + owner + currency, not a
   contract id — see "What `CashHolding` maps to" below), plus the shared
-  **`tryMoveCash`** DvP helper both products' settlement choices call
+  **`tryMoveCash`** DvP helper every product's settlement choices call
   into, which resolves both parties' CURRENT accounts by key. Two
   choices, split by what each actually needs to be true: `CreditAccount`
   (`controller issuer` alone) mints new balance — models the custodian
@@ -72,9 +84,10 @@ two copies of the same logic — see "Modules" below and
   `Transfer` call (payer → receiver) exercised as a nested action inside
   a settlement choice.
 - **`Lifecycle.daml`** — Daml **interfaces** hosting trade origination,
-  novation, and termination, written once and shared by both `IRSTrade`
-  and `CDSTrade`: `IProposable`, `INovatable`/`INovationProposal`/
-  `INovationConfirmation`, and `ITerminable`/`ITerminationProposal`.
+  novation, and termination, written once and shared by `IRSTrade`,
+  `CDSTrade`, and `TRSTrade`: `IProposable`, `INovatable`/
+  `INovationProposal`/`INovationConfirmation`, and `ITerminable`/
+  `ITerminationProposal`.
   Modeled directly on the Daml SDK's own `daml-intro-13` tutorial
   (`IAsset`/`Cash`/`NFT`) — see [ARCHITECTURE.md](ARCHITECTURE.md),
   "Shared lifecycle via interfaces", for the full design and why it's
@@ -140,19 +153,63 @@ two copies of the same logic — see "Modules" below and
     `PremiumEvent` / `MarginEvent` / `CreditEventEntry`) live in
     `CDS.daml` itself, not `Types.daml` — see
     [ARCHITECTURE.md](ARCHITECTURE.md), "Qualified imports", for why.
+- **`TRS.daml`** — the TRS-specific contract, same propose-accept shape
+  as `IRS.daml`/`CDS.daml`, modeling an equity index total return swap:
+  - `TradeProposal` — names an `indexName : Text`, an
+    `initialIndexLevel`, and a `financingLeg : FloatingLeg` (reused
+    as-is — the funding leg's `spread` sits on top of whatever overnight
+    rate the oracle fixes at each settlement, same shape as IRS's
+    floating leg). No dividend field anywhere: the underlying is a
+    *total return* index, meaning dividends are already reinvested in
+    the published level, so accounting for them separately would
+    double-count — a deliberate simplification, not an oversight.
+  - `TRSTrade` — the live, dual-signatory contract. Implements
+    `INovatable`/`ITerminable` identically to `IRSTrade`/`CDSTrade`.
+    Tracks four fields no other product needs: `lastIndexLevel` (prior
+    observation), `lastResetIndexLevel` (the reset anchor),
+    `lastSettledDate` (day-count basis for funding, exactly like IRS's
+    field of the same name), and `vmPaidSinceReset` (running sum of
+    daily performance already paid out since the last reset).
+  - `SettleMargin` — the daily variation-margin choice: the oracle
+    submits `asOf`, `indexLevel`, and `observedRate` (the funding
+    fixing); the contract computes the day's index move against the
+    **prior day's level**, nets it against accrued financing
+    (`observedRate + financingLeg.spread`, over the real elapsed days),
+    and moves cash atomically.
+  - `SettleReset` — the periodic true-up: same inputs, but measures the
+    **cumulative** return since the last reset (against
+    `lastResetIndexLevel`, not the prior day) and pays only the
+    **residual** not already exchanged via daily `SettleMargin` calls —
+    see [ARCHITECTURE.md](ARCHITECTURE.md)'s TRS section for why this
+    never double-pays performance, even though daily percentage moves
+    compound rather than telescope.
+  - `AdjustForCorporateAction` — a state-mutating oracle event with
+    **no cash leg at all** (a shape none of IRS/CDS's oracle choices
+    have): the oracle submits a multiplicative `adjustmentFactor`
+    rebasing both `lastIndexLevel` and `lastResetIndexLevel` together,
+    modeling a stock split, special dividend, or index reconstitution
+    that rescales the published level without changing anyone's actual
+    economic exposure.
+  - `NovationProposal` / `NovationConfirmation` / `TerminationProposal`
+    — same slim shape as IRS's/CDS's; `substitute` swaps only the
+    party, so the index anchors and `vmPaidSinceReset` ride along
+    intact through a novation.
+  - `SettlementFailure` — per-product, same terminal shape as IRS's/
+    CDS's.
 - **`Setup.daml`** — the init-script (wired via `daml.yaml`'s
   `init-script`, runs automatically on every `daml start`). Staged into
   separate functions rather than one long script: `setupUsersAndAccounts`
   allocates Alice, Bob, Charlie, Bank, Oracle, registers them as
   Navigator/JSON API users, and funds **one** `CashHolding` per party
   (Alice, Bob, Charlie — see "What `CashHolding` maps to" below for why
-  one account safely serves both seeded trades, and any number more);
-  `proposeIrsTrade`/`proposeCdsTrade` each create a `TradeProposal`;
-  `acceptIrsTrade`/`acceptCdsTrade` each exercise `AcceptTrade` to make
-  it live. `setup` calls all of these in order — **comment out either
-  `acceptXxxTrade` call to demo `AcceptTrade` yourself** from Navigator
-  instead of having it already done: the corresponding `TradeProposal`
-  is left sitting there, live, for Bob to open and accept.
+  one account safely serves all three seeded trades, and any number
+  more); `proposeIrsTrade`/`proposeCdsTrade`/`proposeTrsTrade` each
+  create a `TradeProposal`; `acceptIrsTrade`/`acceptCdsTrade`/
+  `acceptTrsTrade` each exercise `AcceptTrade` to make it live. `setup`
+  calls all of these in order — **comment out any `acceptXxxTrade` call
+  to demo `AcceptTrade` yourself** from Navigator instead of having it
+  already done: the corresponding `TradeProposal` is left sitting there,
+  live, for Bob to open and accept.
 - **`IRSTest.daml`** — IRS's Daml Script tests (31 tests): direct,
   ledger-free unit tests of `dayCountFraction`, plus full lifecycle tests
   covering every explicit choice at least once. Unchanged by the
@@ -164,6 +221,16 @@ two copies of the same logic — see "Modules" below and
   settlement, margin (happy path and default), novation and termination
   (via the same shared interfaces), and the credit-event-specific cases
   (payout success, default, out-of-band recovery rate rejected).
+- **`TRSTest.daml`** — TRS's Daml Script tests (21 tests), same fixture
+  pattern again: proposal/accept/reject, daily VM both directions,
+  funding-accrual-per-elapsed-day, the **compounding-residual
+  centerpiece** (two offsetting daily moves that net to zero while the
+  period's true return is nonzero, trued up exactly by `SettleReset`'s
+  residual), a zero-residual control case, reset re-anchoring, corporate
+  action rebases (with and without an intervening reset), the full guard
+  set, an insufficient-funds default, and novation/termination via the
+  same shared interfaces (including that accrued state survives a
+  novation).
 
 All state changes follow DAML's archive-and-recreate pattern (no in-place
 mutation). See `ARCHITECTURE.md` for why, and for the broader Canton
@@ -177,8 +244,8 @@ the moment two trades share an account: DAML's archive-and-recreate means
 every balance change swaps in a brand-new contract id, so whichever trade
 settles first silently strands every OTHER trade's stored id, and their
 next settlement fails `CONTRACT_NOT_FOUND`. The stopgap was giving every
-trade its **own segregated account** — workable for the two trades this
-demo seeds, but obviously wrong in general: a real trader can have
+trade its **own segregated account** — workable for the handful of trades
+this demo seeds, but obviously wrong in general: a real trader can have
 hundreds of live positions, and nobody opens a hundred settlement
 accounts to hold them.
 
@@ -186,10 +253,10 @@ The actual fix is a Daml **contract key** (`Cash.daml`'s
 `CashAccountKey` = issuer + owner + currency — see the SDK's own
 `daml-intro-3` tutorial for the pattern). `CashHolding` is now identified
 by that key, not by a contract id, so `Setup.daml` funds exactly **one**
-account per party, and both seeded trades — indeed, any number of
+account per party, and all three seeded trades — indeed, any number of
 trades — settle through it safely: `tryMoveCash` resolves each party's
 CURRENT account via `fetchByKey`/`exerciseByKey` at the moment of each
-settlement (see `IRS.daml`/`CDS.daml`'s `TradeProposal`, which names a
+settlement (see `IRS.daml`/`CDS.daml`/`TRS.daml`'s `TradeProposal`, which names a
 `cashIssuer` and `settlementCurrency` rather than a specific account).
 Nothing is ever stored and later found stale.
 
@@ -244,7 +311,7 @@ be true, not lumped into one loosely-guarded "adjust the balance" choice:
   same as a real bank transfer — not the issuer, and (deliberately) not
   the oracle either.
 
-`tryMoveCash` — the helper every settlement choice in both products calls
+`tryMoveCash` — the helper every settlement choice in every product calls
 — is just **one `Transfer` call**, payer's account to receiver's,
 resolved by key. The interesting part: this works from inside a
 derivatives settlement with **zero special-casing for the oracle** — the
@@ -362,8 +429,8 @@ export PATH="$HOME/.daml/bin:$PATH"   # add to ~/.bashrc or ~/.zshrc
 From the project root:
 
 ```sh
-daml build              # compile the eight modules to a DAR
-daml test               # run both products' Daml Script lifecycle tests (49 total)
+daml build              # compile the ten modules to a DAR
+daml test               # run all three products' Daml Script lifecycle tests (70 total)
 daml start              # sandbox + JSON API (7575) + Navigator (7500),
                         # runs Setup automatically
 ```
@@ -385,20 +452,27 @@ daml start              # sandbox + JSON API (7575) + Navigator (7500),
   through the SAME two accounts — 10,000,000 USD notional, Alice
   (protection buyer) pays Bob (protection seller) a **100bps (1%)**
   running premium on reference entity "Acme Corp", quarterly, maturing
-  2031-07-20.
+  2031-07-20;
+- strikes a live **`TRSTrade`** between **Alice and Bob** the same way,
+  through the SAME two accounts again — 10,000,000 USD notional, Alice
+  (total return receiver) receives the total return of the "SPX-TR"
+  index (starting level 16650.0) from Bob (total return payer), funded at
+  **SOFR flat** (Act360), maturing 2027-07-20.
 
-Leave `daml start` running; the demo below drives both seeded trades. The
-ledger/API ports it prints are: **6865** (gRPC Ledger API), **7575** (JSON
-API), **7500** (Navigator).
+Leave `daml start` running; the demo below drives all three seeded
+trades. The ledger/API ports it prints are: **6865** (gRPC Ledger API),
+**7575** (JSON API), **7500** (Navigator).
 
 ## Demo
 
-A guided walkthrough of both products' full lifecycles: IRS's **daily
-margin in both directions**, a **periodic settlement**, then **novation**
-and **termination** (Part 1) — then CDS's **premium settlement** and
-**credit event** (Part 2), which reuses the exact same novation/
-termination mechanics under the hood but isn't re-walked a second time in
-Navigator, since it's identical to Part 1's. Every step is drivable from
+A guided walkthrough of all three products' full lifecycles, one section
+per product: IRS's **daily margin in both directions**, a **periodic
+settlement**, then **novation** and **termination**; CDS's **premium
+settlement** and **credit event**; TRS's **daily variation margin**,
+**periodic reset**, and **corporate-action rebase**. CDS and TRS both
+reuse the exact same novation/termination mechanics the IRS section
+walks, under the hood, but don't re-walk them a second and third time in
+Navigator, since they're identical to IRS's. Every step is drivable from
 Navigator alone; nothing here needs `daml repl` or any other tool.
 
 ### Open three windows, one identity each
@@ -423,18 +497,22 @@ In each window pick the matching user on Navigator's sign-in screen:
 
 | Window | Log in as | Watches |
 |--------|-----------|---------|
-| 1 | `alice`  | her `CashHolding` (shared by both trades) + both live trades |
-| 2 | `bob`    | his `CashHolding` (shared by both trades) + both live trades |
-| 3 | `oracle` | drives every settlement; sees every account + both trades |
+| 1 | `alice`  | her `CashHolding` (shared by all three trades) + all three live trades |
+| 2 | `bob`    | his `CashHolding` (shared by all three trades) + all three live trades |
+| 3 | `oracle` | drives every settlement; sees every account + all three trades |
 
 Starting balances: **Alice-USD = 1,000,000**, **Bob-USD = 10,000,000** —
-the SAME one account each, settling both the `IRSTrade` and the
-`CDSTrade` (see "What `CashHolding` maps to" above), so watch its balance
-carry forward across Part 1 and Part 2 below rather than resetting
-between them. Keep the account and the live trade visible in Alice's and
+the SAME one account each, settling the `IRSTrade`, the `CDSTrade`, and
+the `TRSTrade` all together (see "What `CashHolding` maps to" above). The
+three sections below (IRS, CDS, TRS) are each written independently, and
+for clarity **assume a fresh `daml start` restart before each one**, so
+every section's tables start from this same clean 1,000,000/10,000,000
+baseline rather than wherever the previous section left the shared
+account. Keep the account and the live trade visible in Alice's and
 Bob's windows — every step below archives-and-recreates them with a new
 balance, so you'll see the numbers change live. (Each move creates a
-*fresh* trade and `CashHolding`; the old ones drop out of the active set.)
+*fresh* trade and `CashHolding`; the old ones drop out of the active
+set.)
 
 > **Try to cheat first (optional):** in Alice's window, open her
 > **Alice-USD** `CashHolding` and exercise **`CreditAccount`** directly
@@ -458,7 +536,7 @@ balance, so you'll see the numbers change live. (Each move creates a
 > deployment — see "Why a plain Alice → Bob transfer fails outside this
 > sandbox" above for what actually would be.
 
-## Part 1 — IRS lifecycle
+## IRS lifecycle
 
 ### 1. Daily variation margin — direction A (Bob → Alice)
 
@@ -669,21 +747,23 @@ from every window with no successor — the trade is over.
 > declining a novation. Either party can be the one to `ProposeTermination`
 > — it isn't limited to whoever proposed the most recent novation.
 
-## Part 2 — CDS lifecycle
+## CDS lifecycle
 
 CDS's novation and termination work **exactly as walked above** — same
 choice names, same tri-party consent flow, same authority-carrying trick
 — because `CDSTrade` implements the identical `Lifecycle.daml` interfaces
-`IRSTrade` does. Nothing new to demo there; this part covers only what's
-actually different about CDS: **one-directional premium settlement** (no
-netting, contrast Part 1 §3) and the **credit event** trigger.
+`IRSTrade` does. Nothing new to demo there; this section covers only
+what's actually different about CDS: **one-directional premium
+settlement** (no netting, contrast the IRS section's periodic settlement)
+and the **credit event** trigger.
 
-`Alice-USD`/`Bob-USD` are the SAME accounts Part 1 just moved — the CDS
-trade was seeded from the start alongside the IRS one, settling through
-the identical `Bank`/`USD` (see "What `CashHolding` maps to" above). So
-the tables below continue from where Part 1 left off — **Alice-USD =
-995,000, Bob-USD = 10,005,000** — not the original 1,000,000/10,000,000,
-unless you've restarted `daml start` since.
+`Alice-USD`/`Bob-USD` are the SAME accounts the IRS section above just
+moved — the CDS trade was seeded from the start alongside the IRS one,
+settling through the identical `Bank`/`USD` (see "What `CashHolding` maps
+to" above). As noted above, this section **assumes a fresh `daml start`
+restart**, so the tables below start from the clean seeded baseline —
+**Alice-USD = 1,000,000, Bob-USD = 10,000,000** — rather than wherever
+the IRS section happened to leave the shared account.
 
 ### 1. Premium settlement (the running spread)
 
@@ -701,7 +781,7 @@ premiumLeg.rate × notional × dayFraction = netPayment  → Alice (buyer) pays 
 ```
 
 The seeded trade's premium leg is `Thirty360` at `1%` (100bps), so the
-same clean `90/360 = 0.25` fraction as Part 1 applies:
+same clean `90/360 = 0.25` fraction as the IRS section applies:
 
 ```
 0.01 × 10,000,000 × 0.25 = 25,000  → Alice pays Bob
@@ -709,8 +789,8 @@ same clean `90/360 = 0.25` fraction as Part 1 applies:
 
 | | Before | After |
 |---|--:|--:|
-| Alice-USD | 995,000 | **970,000** |
-| Bob-USD   | 10,005,000 | **10,030,000** |
+| Alice-USD | 1,000,000 | **975,000** |
+| Bob-USD   | 10,000,000 | **10,025,000** |
 
 The recreated trade advances `lastSettledDate` and appends a
 `PremiumEvent` to `history` — same rolling-schedule guard as
@@ -719,7 +799,7 @@ fails; the next quarter is `2027-01-20`.
 
 ### 2. Variation margin
 
-Identical mechanics to Part 1 §1–2, against `protectionBuyer`/
+Identical mechanics to the IRS section's §1–2, against `protectionBuyer`/
 `protectionSeller` instead of `fixedRatePayer`/`floatingRatePayer` — not
 walked again here.
 
@@ -745,8 +825,8 @@ payout = notional × (1 − recoveryRate) = 10,000,000 × (1 − 0.4) = 6,000,00
 
 | | Before | After |
 |---|--:|--:|
-| Alice-USD | 970,000 | **6,970,000** |
-| Bob-USD   | 10,030,000 | **4,030,000** |
+| Alice-USD | 975,000 | **6,975,000** |
+| Bob-USD   | 10,025,000 | **4,025,000** |
 
 The `CDSTrade` is archived with **no successor** — check every window,
 it's simply gone — and a `CreditEventSettlement` receipt appears instead,
@@ -777,13 +857,198 @@ through that same account.
 > *see* them in order to move them. See [ARCHITECTURE.md](ARCHITECTURE.md),
 > "Authority vs. visibility".
 
+## TRS lifecycle
+
+TRS's novation and termination work **exactly as walked in the IRS
+section** — same choice names, same tri-party consent flow — because
+`TRSTrade` implements the identical `Lifecycle.daml` interfaces
+`IRSTrade`/`CDSTrade` do. Not re-walked here either; this section covers
+only what's new: **daily variation margin against the prior day's
+level**, a **periodic reset that trues up only the residual**, and a
+**corporate action** that rebases the index scale with no cash leg at
+all.
+
+`Alice-USD`/`Bob-USD` are again the SAME accounts the IRS and CDS
+sections above just moved — the `TRSTrade` was seeded from the start
+alongside the IRS and CDS trades, settling through the identical
+`Bank`/`USD` (see "What `CashHolding` maps to" above). As noted above,
+this section too **assumes a fresh `daml start` restart**, so the tables
+below start from the clean seeded baseline again — **Alice-USD =
+1,000,000, Bob-USD = 10,000,000** — rather than wherever the CDS section
+happened to leave the shared account.
+
+Funding throughout uses `observedRate = 0.036` (3.6%) against the SPX-TR
+index — every step below advances the date by exactly **9 days**, the
+smallest gap for which Act360's day fraction (`elapsedDays / 360`)
+divides evenly at `Numeric 10` (`9 / 360 = 0.025` exactly); a plain 1-day
+gap leaves a `~0.000008` rounding remainder in the funding amount — see
+`TRSTest.daml`'s comment on this for the full explanation. On
+10,000,000 notional that's `0.036 × 10,000,000 × 0.025 = 9,000` funding
+per 9-day step. The seeded `initialIndexLevel` is `16650.0` — a round
+number in the ballpark of where SPX-TR actually trades, picked for
+demo-arithmetic convenience rather than a live quote (see "What's
+intentionally simplified" below); every dollar amount that follows is a
+pure ratio of notional, so it's identical regardless of the index's
+absolute level — only the *percentage* moves matter.
+
+### 1. Daily variation margin — index up
+
+In the **oracle** window, open the live `TRSTrade` and exercise
+**`SettleMargin`**:
+
+- `asOf` = `2026-07-29` (9 days after the 2026-07-20 effective date)
+- `indexLevel` = `18315.0` (+10% from the seeded 16650.0)
+- `observedRate` = `0.036`
+
+The contract measures the move against the **prior observation**
+(`lastIndexLevel`, seeded from `initialIndexLevel`) and nets it against
+accrued funding:
+
+```
+dailyPerf = (18315 − 16650) / 16650 × 10,000,000 = 1,000,000
+funding   = (0.036 + 0) × 10,000,000 × (9/360) = 9,000
+net       = 1,000,000 − 9,000 = 991,000  → Bob (payer) pays Alice (receiver)
+```
+
+| | Before | After |
+|---|--:|--:|
+| Alice-USD | 1,000,000 | **1,991,000** |
+| Bob-USD   | 10,000,000 | **9,009,000** |
+
+The recreated trade advances `lastIndexLevel` to `18315.0`,
+`lastSettledDate` to `2026-07-29`, and `vmPaidSinceReset` to
+`1,000,000` — `lastResetIndexLevel` stays at `16650.0`, untouched by a
+daily VM.
+
+### 2. Daily variation margin — index down (the compounding case)
+
+On the current `TRSTrade`, exercise **`SettleMargin`** again:
+
+- `asOf` = `2026-08-07` (9 days later)
+- `indexLevel` = `16483.5` (exactly −10% of 18315.0)
+- `observedRate` = `0.036`
+
+```
+dailyPerf = (16483.5 − 18315) / 18315 × 10,000,000 = −1,000,000
+funding   = 9,000
+net       = −1,000,000 − 9,000 = −1,009,000  → Alice pays Bob
+```
+
+| | Before | After |
+|---|--:|--:|
+| Alice-USD | 1,991,000 | **982,000** |
+| Bob-USD   | 9,009,000 | **10,018,000** |
+
+`vmPaidSinceReset` returns to **`0`** (`1,000,000 + (−1,000,000)`) — the
+two daily moves paid equal and opposite amounts. But the index itself
+is **not** back where it started: 16650 → 18315 → 16483.5 is a genuine
+**−1%** over the two days, because each daily percentage move applies to
+a *different* base (16650, then 18315) — the well-known daily-reset
+compounding effect (see [ARCHITECTURE.md](ARCHITECTURE.md)'s TRS
+section). The next step's reset is exactly what catches this gap.
+
+### 3. Periodic reset (the residual true-up)
+
+On the current `TRSTrade`, exercise **`SettleReset`**:
+
+- `asOf` = `2026-08-16` (9 days later)
+- `indexLevel` = `16483.5` (unchanged since the last VM)
+- `observedRate` = `0.036`
+
+Unlike `SettleMargin`, this measures the **cumulative** return since the
+last reset (against `lastResetIndexLevel`, still `16650.0`) and pays
+only what daily VM hasn't already exchanged:
+
+```
+cumulative = (16483.5 − 16650) / 16650 × 10,000,000 = −100,000
+residual   = cumulative − vmPaidSinceReset = −100,000 − 0 = −100,000
+funding    = 9,000
+net        = −100,000 − 9,000 = −109,000  → Alice pays Bob
+```
+
+| | Before | After |
+|---|--:|--:|
+| Alice-USD | 982,000 | **873,000** |
+| Bob-USD   | 10,018,000 | **10,127,000** |
+
+The residual is exactly the compounding gap from step 2 — the two daily
+VMs summed to zero, yet the index is genuinely down 1%, and the reset
+pays precisely that difference, **never** the two days' performance a
+second time. `lastResetIndexLevel` re-anchors to `16483.5`,
+`vmPaidSinceReset` returns to `0`, ready for the next period.
+
+> **Zero-residual check:** if a reset's `indexLevel` exactly matches
+> what the daily VMs already trued up to, `residual` comes out to `0`
+> and the reset moves only funding — see `TRSTest.daml`'s
+> `testZeroResidualReset` for this exercised directly.
+
+### 4. Corporate action (rebase, no cash)
+
+The index provider announces a corporate action rescaling the published
+level — e.g. an index reconstitution. In the **oracle** window, on the
+current `TRSTrade`, exercise **`AdjustForCorporateAction`**:
+
+- `actionType` = `IndexReconstitution`
+- `asOf` = `2026-08-16` (same day is fine — no date-ordering guard here)
+- `adjustmentFactor` = `0.01`
+
+**No cash moves at all** — check Alice's and Bob's balances, unchanged.
+Both `lastIndexLevel` and `lastResetIndexLevel` are rebased together
+(`16483.5 → 164.835`), so the next settlement measures against the new
+scale rather than booking a phantom ~99% loss. `lastSettledDate` is
+**not** touched by a corporate action — only `SettleMargin`/
+`SettleReset` advance it, so the next VM's funding still counts elapsed
+days from `2026-08-16` (the reset three steps up), not from this rebase.
+
+### 5. Daily variation margin — after the rebase
+
+On the current `TRSTrade`, exercise **`SettleMargin`**:
+
+- `asOf` = `2026-08-25` (9 days after the reset in step 3 — the
+  corporate action didn't move `lastSettledDate`, so this is still a
+  clean 9-day funding gap)
+- `indexLevel` = `168.1317` (+2% of the rebased 164.835)
+- `observedRate` = `0.036`
+
+```
+dailyPerf = (168.1317 − 164.835) / 164.835 × 10,000,000 = 200,000
+funding   = 9,000
+net       = 200,000 − 9,000 = 191,000  → Bob pays Alice
+```
+
+| | Before | After |
+|---|--:|--:|
+| Alice-USD | 873,000 | **1,064,000** |
+| Bob-USD   | 10,127,000 | **9,936,000** |
+
+A genuine +2% move against the rebased scale nets a clean 191,000 —
+proof the rebase in step 4 didn't distort the next settlement, because
+both anchors moved together. See `TRSTest.daml`'s
+`testCorporateActionRebaseNoPhantomLoss` for this guarded directly, and
+`testCorporateActionRebaseThenResetResidualCorrect` for confirming a
+reset's residual still comes out right after a mid-period rebase too.
+
+> **Guards:** `indexLevel ≤ 0`, `observedRate` outside `[0, 1]`, and — on
+> `SettleMargin` only — a daily move greater than 50% (a fat-fingered
+> `indexLevel`, mirroring IRS's MTM-vs-notional guard) are all rejected
+> outright; `SettleReset` has no such daily-move bound, since a
+> legitimate reset can span a large gap. `adjustmentFactor ≤ 0` is
+> rejected on `AdjustForCorporateAction`, but there's deliberately no
+> upper bound — a real rebase can be `×0.01` (the demo just used one).
+>
+> **Insufficient funds:** same as every other settlement in this
+> codebase, a payer who can't cover a `SettleMargin`/`SettleReset` move
+> archives the trade into `SettlementFailure` instead — see
+> `TRSTest.daml`'s `testInsufficientFundsDefaultsFromSettleMargin`.
+
 ## What's intentionally simplified / left as TODO
 
-### Both products
+### All three products
 
-- Mark-to-market and rate fixings (including CDS's `recoveryRate`) are
-  trusted oracle inputs; there's no on-ledger cross-check of the number
-  itself (a real deployment would use a signed/attested feed).
+- Mark-to-market and rate fixings (including CDS's `recoveryRate` and
+  TRS's `indexLevel`/`observedRate`) are trusted oracle inputs; there's
+  no on-ledger cross-check of the number itself (a real deployment would
+  use a signed/attested feed).
 - No grace period: a payer who can't cover a settlement/margin/credit-event
   move fails immediately. Real CSAs allow a cure period (typically T+1)
   before failure-to-pay escalates to a formal ISDA Master Agreement Event
@@ -795,6 +1060,7 @@ through that same account.
   deployment would use an external, standards-based token (Canton Token
   Standard / CIP-56) representing a tokenized deposit or similar. No
   formal verification, no ISDA SIMM/margin-methodology integration yet.
+- Inital Margin is not posted
 
 ### IRS
 
@@ -830,6 +1096,60 @@ through that same account.
   model only has the running premium.
 - **`referenceEntity` is a plain `Text`**, not a structured
   legal-entity/RED-code reference.
+
+### TRS
+
+- **Fixed (non-resetting) notional.** A real equity swap's notional can
+  reset with the underlying at each period (following the number of
+  index units, not a fixed dollar amount); this model keeps `notional`
+  constant for the trade's life.
+- **Total-return index by construction, so no separate dividend or
+  withholding-tax modeling.** `indexName`'s published level already
+  reflects reinvested dividends — a real deployment settling against a
+  *price*-return index (not total-return) would need a genuine
+  `AccrueDividend`-style choice to true up the difference; that's
+  explicitly out of scope here since "SPX-TR"-style total-return indices
+  don't need it.
+- **Simple, non-compounded daily funding accrual** — each `SettleMargin`/
+  `SettleReset` call accrues `(observedRate + spread) × notional ×
+  dayCountFraction` once per call, rather than the market-standard daily
+  compounding of an overnight rate (e.g. compounded SOFR) within the
+  accrual period.
+- **Corporate actions as a single multiplicative factor** — real ISDA
+  2002 Equity Derivatives Definitions machinery distinguishes many
+  corporate-action types (extraordinary dividend, merger, tender offer,
+  nationalization, delisting, ...) each with its own adjustment
+  methodology; this model reduces all of them to one
+  `adjustmentFactor : Decimal` rebasing both index anchors. Heavier
+  ISDA-adjacent outcomes — substituting the reference index entirely
+  (`SubstituteReference`), reducing exposure and settling the cancelled
+  portion (`PartialCancelAndPay`), or a calculation-agent-determined
+  early close-out (`CancelAndPay`) — aren't modeled at all, not even as
+  stubs; `AdjustForCorporateAction`'s multiplicative rebase is the only
+  corporate-action response this codebase has.
+- **`AdjustForCorporateAction` is controlled by `oracle`, not a separate
+  Calculation Agent party.** Real ISDA practice distinguishes a party
+  that reports objective market data from the Calculation Agent, who
+  makes discretionary determinations like how to rebase for a corporate
+  action — a real distinction this codebase collapses into one party for
+  simplicity. Relatedly, the choice only prevents "phantom VM" (a stale
+  pre-event anchor compared against a post-event level producing a
+  catastrophic false margin call) if the oracle actually calls it
+  *before* the next `SettleMargin`/`SettleReset` observes a post-event
+  level — there's no on-ledger way to detect a forgotten rebase step; see
+  [ARCHITECTURE.md](ARCHITECTURE.md)'s TRS section for this traced
+  through in full.
+- **`indexName` is a plain `Text`**, not a structured index/ticker
+  reference.
+- **The seeded `initialIndexLevel` (16650.0) is a round approximation**
+  in the ballpark of where SPX-TR actually trades, chosen so every demo/
+  test number stays an exact, terminating decimal (see the day-count
+  note above) — not a live quote, and not meant to track the real index
+  day to day.
+- **Early termination pays no close-out amount.** `ProposeTermination`/
+  `AcceptTermination` end the trade with no final mark-to-market
+  settlement — in practice, a trade would settle a final `SettleReset`
+  first (parallels CDS's no-accrued-premium-on-termination note above).
 
 ## Goals
 
