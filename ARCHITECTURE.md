@@ -315,6 +315,37 @@ just the same contract, which "Propose-accept" below already covers):
    "Authority vs. visibility" above) and the controller of the *outer*
    `SettleMargin` choice.
 
+The same three steps, drawn as nesting — each inner box **inherits the
+whole authority pool of the box it sits inside** and adds the exercised
+contract's own signatories to it, which is why a choice deep in the tree
+can demand a controller nobody explicitly named at the top:
+
+```mermaid
+flowchart TB
+    subgraph L1["Depth 1 — oracle exercises SettleMargin on IRSTrade"]
+        direction TB
+        N1["controller needed: <b>oracle</b> — satisfied by the submitter's actAs<br/>signatories of IRSTrade join for free: fixedRatePayer, floatingRatePayer<br/><b>pool: oracle + fixedRatePayer + floatingRatePayer</b>"]
+        subgraph L2["Depth 2 — Transfer on the PAYER's CashHolding"]
+            direction TB
+            N2["controller needed: <b>owner</b> (= payer) — already in the pool, inherited from depth 1<br/>signatory of this CashHolding joins for free: issuer (Bank)<br/><b>pool: oracle + fixedRatePayer + floatingRatePayer + issuer</b>"]
+            subgraph L3["Depth 3 — CreditAccount on the RECEIVER's CashHolding"]
+                direction TB
+                N3["controller needed: <b>issuer</b> — already in the pool, inherited from depth 2<br/>(the receiver's account is signed by the SAME Bank party)<br/><b>nothing new required — and the oracle was never a controller of either cash choice</b>"]
+            end
+        end
+    end
+```
+
+Read it as roles overlapping across layers: the **oracle** contributes
+only the outermost controller (its `actAs`); the **counterparties**
+contribute authority not by submitting anything but by being signatories
+of the trade contract being exercised — which is what puts the *payer*
+in the pool by the time `Transfer` demands its `owner`; and the **Bank**
+enters the pool only at depth 2, as a side effect of `Transfer` touching
+an account it signed — arriving exactly one level before depth 3 needs
+it as `CreditAccount`'s controller. Each party's authority "falls
+through" from the layer where it entered to every layer below.
+
 The general shape: a contract's signatories are always self-satisfied for
 choices on *that* contract, and then join the pool of parties available
 to authorize whatever that choice's body does next — so authority
@@ -544,7 +575,7 @@ live trade, which `toLiveTrade` is.
 its `history` field is differently-typed per product (IRS's
 `CashflowEvent`/`MarginEvent`, CDS's
 `PremiumEvent`/`MarginEvent`/`CreditEventEntry`, TRS's
-`SettlementEvent`/`CorporateActionEvent`), so there's no single
+`DailyVMEvent`/`ResetEvent`/`IndexAdjustmentEvent`), so there's no single
 interface method signature that could return it — unifying it would
 need the embedded-value trick applied to a type that doesn't have one
 natural underlying "trade" to embed, the same gap that's real for
@@ -576,11 +607,11 @@ every market participant simultaneously. Nothing about the oracle's
 input encodes which trade it's for; that's derived entirely from which
 contract the choice happens to be exercised on.
 
-**Not every oracle choice moves cash — TRS's `AdjustForCorporateAction`
+**Not every oracle choice moves cash — TRS's `AdjustIndexLevel`
 is the first one that structurally can't.** Every settlement/margin/
 credit-event choice above returns `Either (ContractId SettlementFailure)
 (ContractId <Trade>)`, because a cash leg can fail (insufficient funds).
-A corporate-action rebase has no cash leg at all — it only rescales
+An index-level rebase has no cash leg at all — it only rescales
 `TRSTrade`'s own stored index levels — so it can't fail that way, and
 its return type reflects that honestly: plain `ContractId TRSTrade`, no
 `Either`, nothing for a caller to handle on a "declined" branch that
@@ -636,7 +667,7 @@ payer's account can't cover the amount, the same transaction instead
 archives the trade into a terminal `SettlementFailure` (no successor
 trade for any product's periodic choices, so the ledger structurally
 prevents any further lifecycle action on that path). TRS's
-`AdjustForCorporateAction` is the one settlement-adjacent choice with no
+`AdjustIndexLevel` is the one settlement-adjacent choice with no
 cash leg to hand off at all — see "Oracle / calculation-agent pattern"
 above.
 
@@ -766,24 +797,33 @@ accumulates it itself, on every `SettleMargin`, and `SettleReset` reads
 it back — the same "derive from state you already control" discipline,
 applied to price instead of dates.
 
-**Why `AdjustForCorporateAction` rebases *both* anchors together.**
+**Why `AdjustIndexLevel` rebases *both* anchors together, and why it's
+scoped to index-provider events, not single-stock corporate actions.**
 `lastIndexLevel` and `lastResetIndexLevel` are both expressed in the
-same published-index units. If a provider rescales the index (a stock
-split, special dividend, or reconstitution) and only one anchor were
+same published-index units. If the provider rescales the index (an
+`IndexAdjustmentReason` of `IndexRebasing`, `MethodologyChange`, a
+`SuccessorIndex`, or a `DataCorrection`) and only one anchor were
 rebased, the next settlement would compare a rebased number against a
 stale one and book a phantom gain or loss proportional to the rebase
 factor — e.g. a ×0.01 rebase applied to only one anchor would look like
 a ~99% move overnight. Rebasing both together, by the same factor, keeps
 every subsequent ratio-based calculation (`SettleMargin`'s and
 `SettleReset`'s formulas above are both pure ratios) invariant under the
-rescaling — see `TRSTest.daml`'s `testCorporateActionRebaseNoPhantomLoss`.
+rescaling — see `TRSTest.daml`'s `testIndexAdjustmentNoPhantomLoss`. Note
+what's deliberately absent from `IndexAdjustmentReason`: a single-name
+`StockSplit`/`SpecialDividend`/`MergerAdjustment` on one constituent
+isn't a reason this choice exists to handle at all — a properly
+maintained index absorbs those via its own divisor, so the *published*
+level never has a discontinuity from them in the first place. Only
+events the provider applies to the *series itself* can actually require
+a rebase here.
 `vmPaidSinceReset`, by contrast, is **not** rebased — it's already
 denominated in currency, and a currency amount doesn't change meaning
-just because the index's unit scale did; `testCorporateActionRebaseThenResetResidualCorrect`
+just because the index's unit scale did; `testIndexAdjustmentThenResetResidualCorrect`
 confirms the reset's residual still comes out correct after a mid-period
-rebase for exactly this reason. `lastSettledDate` is untouched by a
-corporate action too, for an unrelated reason: it's a *funding* accrual
-basis, and a corporate action isn't a settlement — see README.md's TRS
+rebase for exactly this reason. `lastSettledDate` is untouched by an
+index adjustment too, for an unrelated reason: it's a *funding* accrual
+basis, and an index adjustment isn't a settlement — see README.md's TRS
 section, step 4, for this traced through a concrete date gap.
 
 ```mermaid
@@ -791,17 +831,17 @@ stateDiagram-v2
     [*] --> TRSTrade
     TRSTrade --> TRSTrade: SettleMargin / SettleReset (success -- trade continues)
     TRSTrade --> SettlementFailure: SettleMargin / SettleReset (payer can't cover it)
-    TRSTrade --> TRSTrade: AdjustForCorporateAction (no cash leg -- can't fail this way)
+    TRSTrade --> TRSTrade: AdjustIndexLevel (no cash leg -- can't fail this way)
     SettlementFailure --> [*]
 ```
 
-**`AdjustForCorporateAction` is a Calculation Agent act wearing the
+**`AdjustIndexLevel` is a Calculation Agent act wearing the
 oracle's clothes — and one risk it doesn't close.** Real ISDA practice
 distinguishes a party that merely *reports* objective market data (a
 rate fixing, an index level) from the **Calculation Agent**, who makes
 *discretionary determinations* — exactly what "how do we rebase for this
-corporate action" is. This codebase doesn't model that as a separate
-party: `oracle` controls `AdjustForCorporateAction` the same as every
+index event" is. This codebase doesn't model that as a separate
+party: `oracle` controls `AdjustIndexLevel` the same as every
 other choice, for the same reason `Types.daml`'s day-count/rate machinery
 stays inside the Daml choice rather than an off-ledger pricing engine —
 keeping the party model small. Worth naming anyway, because it's a real
@@ -811,14 +851,15 @@ two roles with different trust levels and legal responsibility.
 That said, splitting the party wouldn't close the one real gap here: **a
 single multiplicative `adjustmentFactor` applied to both anchors
 prevents phantom VM only if the calculation agent actually calls
-`AdjustForCorporateAction` before the next `SettleMargin`/`SettleReset`
+`AdjustIndexLevel` before the next `SettleMargin`/`SettleReset`
 observes a post-event level.** If the oracle instead submits a raw
-post-split level straight into `SettleMargin` — forgetting the rebase
-step — the contract has no way to know the discontinuity was a corporate
-action rather than a genuine (fat-fingered-looking, but real) market
-move, and computes exactly the catastrophic phantom daily VM this choice
-exists to prevent. Neither an on-ledger invariant assertion nor a second
-party role would close this by itself — it's an operational-sequencing
+post-event level straight into `SettleMargin` — forgetting the rebase
+step — the contract has no way to know the discontinuity was a
+provider-driven rebase rather than a genuine (fat-fingered-looking, but
+real) market move, and computes exactly the catastrophic phantom daily
+VM this choice exists to prevent. Neither an on-ledger invariant
+assertion nor a second party role would close this by itself — it's an
+operational-sequencing
 dependency on whoever submits oracle data, the same category of trust
 this codebase already places in every other oracle input (see "Oracle /
 calculation-agent pattern" above); it just has a sharper failure mode

@@ -126,8 +126,7 @@ testSettleMarginDownMovesCash = do
 
   Some trade <- queryContractId f.alice newTradeCid
   case trade.history of
-    [SettlementEvent r] -> do
-      assertMsg "kind is DailyVM" (r.kind == DailyVM)
+    [DailyVMEvent r] -> do
       assertMsg "perfAmount is -200000" (r.perfAmount == -200000.0)
       assertMsg "fundingAmount is 9000" (r.fundingAmount == 9000.0)
       assertMsg "Alice paid" (r.paidBy == f.alice)
@@ -210,11 +209,10 @@ testCompoundingResidualTruedUpByReset = do
   assertMsg "reset anchor re-based to 16483.5" (tradeAfterReset.lastResetIndexLevel == 16483.5)
   assertMsg "vmPaidSinceReset zeroed" (tradeAfterReset.vmPaidSinceReset == 0.0)
   case tradeAfterReset.history of
-    [_, _, SettlementEvent r] -> do
-      assertMsg "reset kind" (r.kind == Reset)
+    [_, _, ResetEvent r] -> do
       assertMsg "residual is -100000" (r.perfAmount == -100000.0)
       assertMsg "Alice paid the reset" (r.paidBy == f.alice)
-    _ -> abort "expected three SettlementEvents in history"
+    _ -> abort "expected three settlement events in history"
 
 -- Post-reset, a daily VM measures against the NEW anchor: a +1% move
 -- right after a reset to 16816.5 pays the same 91,000 as the reset's own
@@ -267,39 +265,39 @@ testZeroResidualReset = do
 
   Some trade <- queryContractId f.alice afterReset
   case trade.history of
-    [_, SettlementEvent r] -> do
+    [_, ResetEvent r] -> do
       assertMsg "reset residual is exactly zero" (r.perfAmount == 0.0)
       assertMsg "reset still moved cash for funding" (r.netPayment == 9000.0)
       assertMsg "Alice paid the pure funding" (r.paidBy == f.alice)
-    _ -> abort "expected two SettlementEvents in history"
+    _ -> abort "expected two settlement events in history"
 
--- Corporate action rebase: the provider rebases the index scale
+-- Index adjustment (rebasing): the provider rebases the index scale
 -- (16650 -> 166.5, factor 0.01). No cash moves. A subsequent VM measuring
 -- a genuine +2% move against the REBASED anchor nets a clean 191,000 --
 -- not a phantom ~100% loss, because both anchors moved together.
-testCorporateActionRebaseNoPhantomLoss : Script ()
-testCorporateActionRebaseNoPhantomLoss = do
+testIndexAdjustmentNoPhantomLoss : Script ()
+testIndexAdjustmentNoPhantomLoss = do
   f <- setupTrade 1000000.0 1000000.0
   aliceBalBefore <- balanceOf f.alice
   bobBalBefore <- balanceOf f.bob
 
   rebasedCid <- submit f.oracle do
-    exerciseCmd f.tradeCid AdjustForCorporateAction with
-      actionType = IndexReconstitution; asOf = date 2026 Jul 29; adjustmentFactor = 0.01
+    exerciseCmd f.tradeCid AdjustIndexLevel with
+      reason = IndexRebasing; asOf = date 2026 Jul 29; adjustmentFactor = 0.01
 
   aliceBalAfterRebase <- balanceOf f.alice
   bobBalAfterRebase <- balanceOf f.bob
-  assertMsg "no cash moves on a corporate action" (aliceBalAfterRebase == aliceBalBefore && bobBalAfterRebase == bobBalBefore)
+  assertMsg "no cash moves on an index adjustment" (aliceBalAfterRebase == aliceBalBefore && bobBalAfterRebase == bobBalBefore)
 
   Some rebased <- queryContractId f.alice rebasedCid
   assertMsg "lastIndexLevel rebased to 166.5" (rebased.lastIndexLevel == 166.5)
   assertMsg "lastResetIndexLevel rebased to 166.5" (rebased.lastResetIndexLevel == 166.5)
-  assertMsg "lastSettledDate untouched by a corporate action -- only VM/Reset move it"
+  assertMsg "lastSettledDate untouched by an index adjustment -- only VM/Reset move it"
     (rebased.lastSettledDate == date 2026 Jul 20)
 
   -- +2% of the rebased 166.5 is 169.83. dailyPerf =
   -- (169.83-166.5)/166.5*10M = 200,000. Funding's day-count basis is
-  -- lastSettledDate, which the corporate action above did NOT advance --
+  -- lastSettledDate, which the adjustment above did NOT advance --
   -- so this still spans all the way back to effectiveDate (Jul 20), an
   -- 18-day gap: funding = 18,000; net = 182,000, Bob -> Alice.
   Right afterVM <- submit f.oracle do
@@ -314,8 +312,8 @@ testCorporateActionRebaseNoPhantomLoss = do
 -- need vmPaidSinceReset touched -- it's already in currency, invariant
 -- under a pure unit rebase of the index scale. The reset's residual
 -- still comes out correct against the rebased anchor.
-testCorporateActionRebaseThenResetResidualCorrect : Script ()
-testCorporateActionRebaseThenResetResidualCorrect = do
+testIndexAdjustmentThenResetResidualCorrect : Script ()
+testIndexAdjustmentThenResetResidualCorrect = do
   f <- setupTrade 1000000.0 1000000.0
 
   -- VM (+9d): +2% (16650 -> 16983). net = 191,000, Bob -> Alice.
@@ -328,15 +326,15 @@ testCorporateActionRebaseThenResetResidualCorrect = do
   -- lastResetIndexLevel 16650 -> 1665.0. vmPaidSinceReset stays 200,000
   -- (currency, unaffected).
   rebasedCid <- submit f.oracle do
-    exerciseCmd afterVM AdjustForCorporateAction with
-      actionType = IndexReconstitution; asOf = date 2026 Aug 7; adjustmentFactor = 0.1
+    exerciseCmd afterVM AdjustIndexLevel with
+      reason = IndexRebasing; asOf = date 2026 Aug 7; adjustmentFactor = 0.1
   Some rebased <- queryContractId f.alice rebasedCid
   assertMsg "vmPaidSinceReset untouched by rebase" (rebased.vmPaidSinceReset == 200000.0)
 
   -- Reset (+9d more) at 1731.6 (a further +4% move against the rebased
   -- scale): cumulative = (1731.6-1665)/1665*10M = 400,000; residual =
   -- 400,000 - 200,000 = 200,000. Funding's day-count basis is
-  -- lastSettledDate, which the corporate action did NOT advance -- it's
+  -- lastSettledDate, which the adjustment did NOT advance -- it's
   -- still the VM's date (Jul 29), so this reset spans 18 days back to
   -- it: funding = 18,000; net = 182,000, Bob -> Alice.
   Right afterReset <- submit f.oracle do
@@ -349,7 +347,7 @@ testCorporateActionRebaseThenResetResidualCorrect = do
 
   Some trade <- queryContractId f.alice afterReset
   case trade.history of
-    [_, _, SettlementEvent r] -> assertMsg "residual is 200000" (r.perfAmount == 200000.0)
+    [_, _, ResetEvent r] -> assertMsg "residual is 200000" (r.perfAmount == 200000.0)
     _ -> abort "expected three history entries"
 
 -- Guard: asOf must be strictly after lastSettledDate.
@@ -386,12 +384,12 @@ testDailyMoveFatFingerRejected = do
       asOf = date 2026 Jul 21; indexLevel = 29970.0; observedRate = 0.036
 
 -- Guard: adjustmentFactor must be positive.
-testCorporateActionFactorMustBePositiveRejected : Script ()
-testCorporateActionFactorMustBePositiveRejected = do
+testAdjustmentFactorMustBePositiveRejected : Script ()
+testAdjustmentFactorMustBePositiveRejected = do
   f <- setupTrade 1000000.0 1000000.0
   submitMustFail f.oracle do
-    exerciseCmd f.tradeCid AdjustForCorporateAction with
-      actionType = IndexReconstitution; asOf = date 2026 Jul 21; adjustmentFactor = 0.0
+    exerciseCmd f.tradeCid AdjustIndexLevel with
+      reason = IndexRebasing; asOf = date 2026 Jul 21; adjustmentFactor = 0.0
 
 -- Authorization guard: a counterparty cannot self-submit a settlement.
 testPartyCannotSettle : Script ()

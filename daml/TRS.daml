@@ -19,26 +19,30 @@ import Lifecycle
 -- assumed a TOTAL RETURN index (dividends already reinvested in the
 -- published level), so there is deliberately no separate dividend
 -- accounting -- see README.md, "What's intentionally simplified".
-data CorporateActionType
-  = SpecialDividend
-  | StockSplit
-  | MergerAdjustment
-  | IndexReconstitution
+-- Deliberately NOT single-stock corporate-action vocabulary
+-- (StockSplit/SpecialDividend/MergerAdjustment): a properly-maintained
+-- index absorbs constituent-level events like those via its own divisor,
+-- so the published level never jumps because of them -- that's the
+-- entire point of divisor maintenance. What actually forces a rebase
+-- here is the index PROVIDER doing something to the series itself.
+data IndexAdjustmentReason
+  = IndexRebasing       -- provider resets the base value/divisor (e.g. "rebased to 1000 as of ...")
+  | MethodologyChange   -- provider changes how the index itself is calculated
+  | SuccessorIndex       -- discontinued index replaced by a successor with a different level convention
+  | DataCorrection      -- provider retroactively corrects a calculation error
   deriving (Eq, Show)
 
--- Both cash-settling choices share one record shape; `kind` is the only
--- thing that says which one produced it.
-data SettlementKind
-  = DailyVM
-  | Reset
-  deriving (Eq, Show)
-
--- A single settled VM or Reset event. `perfAmount` is the signed index
--- performance netted against funding to get `netPayment` -- dailyPerf
--- for DailyVM, the true-up residual for Reset (see SettleReset).
+-- Both cash-settling choices share this record shape; which one produced
+-- it is said by the LifecycleEvent constructor wrapping it below
+-- (DailyVMEvent vs ResetEvent), not a tag field on the record itself --
+-- same discriminate-by-constructor convention IRS/CDS already use for
+-- their own settlement records (CashflowEvent/MarginEvent,
+-- PremiumEvent/MarginEvent/CreditEventEntry).
+-- `perfAmount` is the signed index performance netted against funding to
+-- get `netPayment` -- dailyPerf for a daily VM, the true-up residual for
+-- a reset (see SettleReset).
 data TRSSettlementRecord = TRSSettlementRecord
   with
-    kind          : SettlementKind
     asOf          : Date
     indexLevel    : Decimal
     perfAmount    : Decimal
@@ -48,22 +52,26 @@ data TRSSettlementRecord = TRSSettlementRecord
     paidTo        : Party
   deriving (Eq, Show)
 
--- The oracle-submitted rebase the index provider applied (e.g. a divisor
--- change on reconstitution). No cash moves -- see AdjustForCorporateAction.
-data CorporateActionRecord = CorporateActionRecord
+-- The oracle-submitted rebase the index provider applied. No cash moves
+-- -- see AdjustIndexLevel.
+data IndexAdjustmentRecord = IndexAdjustmentRecord
   with
-    actionType    : CorporateActionType
+    reason        : IndexAdjustmentReason
     asOf          : Date
     factor        : Decimal
     oldResetLevel : Decimal
     newResetLevel : Decimal
   deriving (Eq, Show)
 
--- TRSTrade.history holds both event kinds in one chronological audit
--- trail, same shape as IRS's/CDS's own LifecycleEvent (see there).
+-- TRSTrade.history holds all event kinds in one chronological audit
+-- trail, same shape as IRS's/CDS's own LifecycleEvent (see there) --
+-- including the same discriminate-by-constructor convention: DailyVMEvent
+-- and ResetEvent both wrap a TRSSettlementRecord, but which one
+-- happened is said by the constructor, not a field inside the record.
 data LifecycleEvent
-  = SettlementEvent TRSSettlementRecord
-  | CorporateActionEvent CorporateActionRecord
+  = DailyVMEvent TRSSettlementRecord
+  | ResetEvent TRSSettlementRecord
+  | IndexAdjustmentEvent IndexAdjustmentRecord
   deriving (Eq, Show)
 
 
@@ -186,7 +194,6 @@ template TRSTrade
               then (totalReturnPayer, totalReturnReceiver)
               else (totalReturnReceiver, totalReturnPayer)
             record = TRSSettlementRecord with
-              kind = DailyVM
               asOf
               indexLevel
               perfAmount = dailyPerf
@@ -207,7 +214,7 @@ template TRSTrade
               vmPaidSinceReset = vmPaidSinceReset + dailyPerf
               postedByReceiver = if payer == totalReturnReceiver then postedByReceiver + amount else postedByReceiver
               postedByPayer = if payer == totalReturnPayer then postedByPayer + amount else postedByPayer
-              history = history ++ [SettlementEvent record]
+              history = history ++ [DailyVMEvent record]
             pure (Right tradeCid)
           Some available -> do
             defCid <- create SettlementFailure with
@@ -256,7 +263,6 @@ template TRSTrade
               then (totalReturnPayer, totalReturnReceiver)
               else (totalReturnReceiver, totalReturnPayer)
             record = TRSSettlementRecord with
-              kind = Reset
               asOf
               indexLevel
               perfAmount = residual
@@ -278,7 +284,7 @@ template TRSTrade
               vmPaidSinceReset = 0.0
               postedByReceiver = if payer == totalReturnReceiver then postedByReceiver + amount else postedByReceiver
               postedByPayer = if payer == totalReturnPayer then postedByPayer + amount else postedByPayer
-              history = history ++ [SettlementEvent record]
+              history = history ++ [ResetEvent record]
             pure (Right tradeCid)
           Some available -> do
             defCid <- create SettlementFailure with
@@ -290,16 +296,20 @@ template TRSTrade
               history
             pure (Left defCid)
 
-    -- Corporate action: the index provider rebases the published level
-    -- (e.g. a divisor change on reconstitution). No cash moves -- this
+    -- Index adjustment: the index provider rebases the published level
+    -- (an index rebasing, a methodology change, a successor index, or a
+    -- retroactive data correction -- see IndexAdjustmentReason; NOT a
+    -- single-stock corporate action like a split or special dividend,
+    -- which a properly-maintained index absorbs via its own divisor
+    -- without ever touching the published level). No cash moves -- this
     -- is a pure state-mutating oracle event, a shape IRS/CDS don't have
     -- (their oracle choices always settle cash). Both index anchors are
     -- in published-index units, so BOTH must be rebased by the same
     -- factor -- otherwise the next settlement compares a post-rebase
     -- level against a pre-rebase anchor and books phantom P&L ("phantom
     -- VM"). Guarded only for positivity, not a tight fat-finger band:
-    -- legitimate rebasings can be large (e.g. x0.01 on a reconstitution)
-    -- -- deliberately weaker than SettleMargin's daily-move guard.
+    -- legitimate rebasings can be large (e.g. x0.01) -- deliberately
+    -- weaker than SettleMargin's daily-move guard.
     --
     -- Controlled by `oracle`, same as every other choice here, but this
     -- one is conceptually an ISDA "Calculation Agent" determination
@@ -317,9 +327,9 @@ template TRSTrade
     -- agent, consistent with every other trusted-oracle-input
     -- simplification in this codebase (see ARCHITECTURE.md's TRS
     -- section), not something either choice's code can enforce alone.
-    choice AdjustForCorporateAction : ContractId TRSTrade
+    choice AdjustIndexLevel : ContractId TRSTrade
       with
-        actionType       : CorporateActionType
+        reason           : IndexAdjustmentReason
         asOf             : Date
         adjustmentFactor : Decimal
       controller oracle
@@ -329,8 +339,8 @@ template TRSTrade
         assertMsg "adjustmentFactor must be positive"
           (adjustmentFactor > 0.0)
 
-        let record = CorporateActionRecord with
-              actionType
+        let record = IndexAdjustmentRecord with
+              reason
               asOf
               factor = adjustmentFactor
               oldResetLevel = lastResetIndexLevel
@@ -339,7 +349,7 @@ template TRSTrade
         create this with
           lastIndexLevel = lastIndexLevel * adjustmentFactor
           lastResetIndexLevel = lastResetIndexLevel * adjustmentFactor
-          history = history ++ [CorporateActionEvent record]
+          history = history ++ [IndexAdjustmentEvent record]
 
     -- Novation and termination are inherited from Lifecycle.daml's
     -- INovatable/ITerminable interfaces -- identical mechanics to
